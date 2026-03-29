@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PickTime - פלטפורמת ניהול תורים מהפכנית</title>
+    <meta name="description" content="פלטפורמת ניהול תורים חכמה לבעלי מקצוע - מספרות, מכוני יופי, מורים פרטיים ועוד">
+    
+    <!-- Icons from HeroIcons -->
+    <script src="https://unpkg.com/heroicons@2.0.16/24/outline/index.js" type="module"></script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Custom styles -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Assistant:wght@200;300;400;500;600;700;800&display=swap');
+        
+        * {
+            font-family: 'Assistant', sans-serif;
+        }
+        
+        .gradient-bg {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        .hero-pattern {
+            background-color: #667eea;
+            background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.1'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+        }
+        
+        .feature-card {
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-5px);
+            border-color: #667eea;
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        }
+        
+        .theme-card {
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+        
+        .theme-card:hover {
+            transform: scale(1.05);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+    </style>
+    
+    <!-- Tailwind config -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#667eea',
+                        secondary: '#764ba2',
+                        accent: '#f093fb'
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gray-50">
+
+    <!-- Navigation -->
+    <nav class="bg-white shadow-lg sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <div class="flex items-center space-x-4">
+                    <div class="text-2xl font-bold text-primary">⏰ PickTime</div>
+                    <span class="text-sm text-gray-600">פלטפורמת ניהול תורים חכמה</span>
+                </div>
+                
+                <div class="hidden md:flex items-center space-x-6">
+                    <a href="#features" class="text-gray-700 hover:text-primary transition-colors">תכונות</a>
+                    <a href="#themes" class="text-gray-700 hover:text-primary transition-colors">עיצובים</a>
+                    <a href="#pricing" class="text-gray-700 hover:text-primary transition-colors">מחירים</a>
+                    <button onclick="startSetup()" class="bg-primary text-white px-6 py-2 rounded-lg hover:bg-secondary transition-colors">
+                        בואו נתחיל! 🚀
+                    </button>
+                </div>
+                
+                <button class="md:hidden p-2">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section class="hero-pattern min-h-screen flex items-center">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20">
+            <div class="text-center text-white">
+                <h1 class="text-5xl md:text-7xl font-bold mb-6 leading-tight">
+                    PickTime
+                    <br>
+                    <span class="text-yellow-300">ניהול תורים חכם</span>
+                </h1>
+                <p class="text-xl md:text-2xl mb-8 max-w-4xl mx-auto leading-relaxed">
+                    פלטפורמה מהפכנית לבעלי מקצוע - מספרות, מכוני יופי, מורים פרטיים ועוד
+                    <br>
+                    🎨 <strong>עיצוב מותאם</strong> • 📅 <strong>יומן חכם</strong> • 🔔 <strong>התראות אוטומטיות</strong> • 👥 <strong>ניהול לקוחות</strong>
+                </p>
+                
+                <div class="flex flex-col sm:flex-row justify-center items-center space-y-4 sm:space-y-0 sm:space-x-6 mb-12">
+                    <button onclick="startSetup()" class="bg-yellow-400 text-gray-900 px-10 py-4 rounded-xl text-xl font-semibold hover:bg-yellow-300 transition-colors transform hover:scale-105">
+                        🚀 בואו נתחיל בחינם!
+                    </button>
+                    <button onclick="showDemo()" class="border-2 border-white text-white px-10 py-4 rounded-xl text-xl font-semibold hover:bg-white hover:text-primary transition-colors">
+                        📱 צפייה בדמו
+                    </button>
+                </div>
+                
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-8 mt-16">
+                    <div class="bg-white/10 backdrop-blur-sm rounded-xl p-6 text-center">
+                        <div class="text-4xl mb-4">⚡</div>
+                        <h3 class="text-xl font-semibold mb-2">הקמה מהירה</h3>
+                        <p class="text-white/80">עד וזורם תוך 5 דקות</p>
+                    </div>
+                    <div class="bg-white/10 backdrop-blur-sm rounded-xl p-6 text-center">
+                        <div class="text-4xl mb-4">🎨</div>
+                        <h3 class="text-xl font-semibold mb-2">עיצוב מותאם</h3>
+                        <p class="text-white/80">ערכות נושא לכל עסק</p>
+                    </div>
+                    <div class="bg-white/10 backdrop-blur-sm rounded-xl p-6 text-center">
+                        <div class="text-4xl mb-4">📊</div>
+                        <h3 class="text-xl font-semibold mb-2">אנליטיקס חכם</h3>
+                        <p class="text-white/80">דוחות ותובנות מתקדמות</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section id="features" class="py-20 bg-white">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center mb-16">
+                <h2 class="text-4xl font-bold text-gray-900 mb-4">תכונות מתקדמות</h2>
+                <p class="text-xl text-gray-600 max-w-3xl mx-auto">
+                    כל מה שאתה צריך כדי לנהל את העסק שלך בצורה מקצועית ויעילה
+                </p>
+            </div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                <!-- Feature cards will be generated by JavaScript -->
+            </div>
+        </div>
+    </section>
+
+    <!-- Themes Section -->
+    <section id="themes" class="py-20 bg-gray-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center mb-16">
+                <h2 class="text-4xl font-bold text-gray-900 mb-4">ערכות נושא מותאמות</h2>
+                <p class="text-xl text-gray-600">
+                    עיצוב מקצועי המתאים בדיוק לתחום העסק שלך
+                </p>
+            </div>
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8" id="themes-grid">
+                <!-- Theme cards will be generated by JavaScript -->
+            </div>
+        </div>
+    </section>
+
+    <!-- Setup Modal -->
+    <div id="setupModal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+        <div class="bg-white rounded-xl max-w-2xl w-full mx-4 max-h-screen overflow-y-auto">
+            <div class="p-8">
+                <div class="flex justify-between items-center mb-6">
+                    <h3 class="text-2xl font-bold text-gray-900">בואו ניצור את העסק שלך</h3>
+                    <button onclick="closeSetup()" class="text-gray-500 hover:text-gray-700">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                    </button>
+                </div>
+                
+                <form id="businessSetupForm" class="space-y-6">
+                    <!-- Form fields will be generated by JavaScript -->
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-gray-900 text-white py-12">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center">
+                <div class="text-3xl font-bold mb-4">⏰ PickTime</div>
+                <p class="text-gray-400 mb-6">פלטפורמת ניהול תורים חכמה לבעלי מקצוע</p>
+                <div class="text-sm text-gray-500">
+                    © 2024 PickTime. Built with ❤️ by Johnny Tzadaka
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <!-- JavaScript -->
+    <script src="js/app.js"></script>
+</body>
+</html>
