@@ -127,17 +127,23 @@ app.get('/api/themes', (req, res) => {
   res.json(themes);
 });
 
+// 🔍 Check username availability
+app.get('/api/check-username/:username', (req, res) => {
+  const username = req.params.username.toLowerCase().replace(/[^a-z0-9-]/g, '');
+  if (!username || username.length < 3) {
+    return res.json({ available: false, reason: 'שם המשתמש חייב להכיל לפחות 3 תווים באנגלית' });
+  }
+  const taken = Array.from(businesses.values()).some(b => b.slug === username);
+  res.json({ available: !taken, username });
+});
+
 // 🏢 Business routes
 app.post('/api/businesses', (req, res) => {
   try {
     const business = {
       _id: Date.now().toString(),
       ...req.body,
-      slug: req.body.name
-        .replace(/[^\p{L}\p{N}\s-]/gu, '')
-        .replace(/[\s_]+/g, '-')
-        .replace(/^-+|-+$/g, '')
-        .toLowerCase() || `business-${Date.now()}`,
+      slug: (req.body.username || '').toLowerCase().replace(/[^a-z0-9-]/g, '') || `business-${Date.now()}`,
       createdAt: new Date().toISOString(),
       isActive: true
     };

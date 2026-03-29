@@ -215,6 +215,21 @@ class PickTimeApp {
                 </div>
                 
                 <div class="md:col-span-2">
+                    <label class="block text-sm font-medium text-gray-700 mb-2">שם משתמש (באנגלית) - הלינק האישי שלך</label>
+                    <div class="relative">
+                        <input type="text" name="username" required 
+                               class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent"
+                               placeholder="my-business"
+                               pattern="[a-zA-Z0-9-]+"
+                               oninput="app.checkUsername(this.value)"
+                               style="direction: ltr; text-align: left;">
+                        <span id="usernameStatus" class="absolute left-3 top-2.5 text-lg"></span>
+                    </div>
+                    <p id="usernameHint" class="text-xs text-gray-500 mt-1">אותיות באנגלית, מספרים ומקפים בלבד. לפחות 3 תווים.</p>
+                    <p class="text-xs text-gray-400 mt-1" id="usernamePreview"></p>
+                </div>
+                
+                <div class="md:col-span-2">
                     <label class="block text-sm font-medium text-gray-700 mb-2">כתובת העסק</label>
                     <input type="text" name="address" 
                            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent"
@@ -288,6 +303,7 @@ class PickTimeApp {
         const formData = new FormData(e.target);
         const businessData = {
             name: formData.get('businessName'),
+            username: formData.get('username'),
             category: formData.get('category'),
             theme: this.selectedTheme || formData.get('category'),
             owner: {
@@ -373,6 +389,46 @@ class PickTimeApp {
     showDemo() {
         // For now, just show an alert. In the future, this could open a demo modal
         alert('הדמו יהיה זמין בקרוב! 🚀');
+    }
+
+    checkUsername(value) {
+        const clean = value.toLowerCase().replace(/[^a-z0-9-]/g, '');
+        const input = document.querySelector('input[name="username"]');
+        if (input.value !== clean) input.value = clean;
+        
+        const status = document.getElementById('usernameStatus');
+        const hint = document.getElementById('usernameHint');
+        const preview = document.getElementById('usernamePreview');
+        
+        if (!clean || clean.length < 3) {
+            status.textContent = '';
+            hint.textContent = 'אותיות באנגלית, מספרים ומקפים בלבד. לפחות 3 תווים.';
+            hint.className = 'text-xs text-gray-500 mt-1';
+            preview.textContent = '';
+            return;
+        }
+        
+        preview.textContent = `${window.location.origin}/${clean}`;
+        
+        clearTimeout(this._usernameTimer);
+        status.textContent = '⏳';
+        this._usernameTimer = setTimeout(async () => {
+            try {
+                const res = await fetch(`/api/check-username/${clean}`);
+                const data = await res.json();
+                if (data.available) {
+                    status.textContent = '✅';
+                    hint.textContent = 'שם המשתמש פנוי!';
+                    hint.className = 'text-xs text-green-600 mt-1';
+                } else {
+                    status.textContent = '❌';
+                    hint.textContent = data.reason || 'שם המשתמש תפוס';
+                    hint.className = 'text-xs text-red-600 mt-1';
+                }
+            } catch (err) {
+                status.textContent = '';
+            }
+        }, 300);
     }
 }
 
