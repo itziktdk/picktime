@@ -134,10 +134,10 @@ app.post('/api/businesses', (req, res) => {
       _id: Date.now().toString(),
       ...req.body,
       slug: req.body.name
-        .toLowerCase()
-        .replace(/[^\w\s-]/g, '')
-        .replace(/[\s_-]+/g, '-')
-        .replace(/^-+|-+$/g, ''),
+        .replace(/[^\p{L}\p{N}\s-]/gu, '')
+        .replace(/[\s_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .toLowerCase() || `business-${Date.now()}`,
       createdAt: new Date().toISOString(),
       isActive: true
     };
