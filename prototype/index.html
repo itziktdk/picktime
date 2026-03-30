@@ -1,0 +1,2845 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PickTime — ניהול תורים לעסקים קטנים</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;600;700;800;900&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+/* ============================================
+   PICKTIME PROTOTYPE — Design System
+   Apple-inspired, RTL Hebrew, Mobile-first
+   ============================================ */
+
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  /* Primary palette */
+  --primary-dark: #1a1a2e;
+  --primary-mid: #16213e;
+  --accent: #6366f1;
+  --accent-light: #818cf8;
+  --accent-dark: #4f46e5;
+  --success: #10b981;
+  --success-light: #d1fae5;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+
+  /* Neutrals */
+  --bg: #ffffff;
+  --bg-secondary: #f8fafc;
+  --bg-tertiary: #f1f5f9;
+  --text-primary: #0f172a;
+  --text-secondary: #64748b;
+  --text-tertiary: #94a3b8;
+  --border: #e2e8f0;
+  --border-light: #f1f5f9;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.06);
+  --shadow-lg: 0 8px 30px rgba(0,0,0,0.08);
+  --shadow-xl: 0 20px 60px rgba(0,0,0,0.1);
+
+  /* Glass */
+  --glass-bg: rgba(255,255,255,0.72);
+  --glass-border: rgba(255,255,255,0.2);
+
+  /* Radius */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-full: 9999px;
+
+  /* Transitions */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: 'Heebo', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  color: var(--text-primary);
+  background: var(--bg);
+  line-height: 1.6;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ============================================
+   NAV — Sticky top navigation
+   ============================================ */
+
+.nav-section-selector {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  background: var(--glass-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border-light);
+  transition: all 0.3s var(--ease);
+}
+
+.nav-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.nav-logo {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: -0.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.nav-logo svg {
+  width: 28px;
+  height: 28px;
+}
+
+.nav-links {
+  display: flex;
+  gap: 4px;
+  list-style: none;
+}
+
+.nav-links a {
+  text-decoration: none;
+  color: var(--text-secondary);
+  font-size: 0.875rem;
+  font-weight: 500;
+  padding: 8px 16px;
+  border-radius: var(--radius-full);
+  transition: all 0.2s var(--ease);
+}
+
+.nav-links a:hover,
+.nav-links a.active {
+  color: var(--accent);
+  background: rgba(99,102,241,0.08);
+}
+
+@media (max-width: 768px) {
+  .nav-links { display: none; }
+}
+
+/* ============================================
+   SECTION DIVIDERS
+   ============================================ */
+
+.section-screen {
+  min-height: 100vh;
+  padding: 100px 24px 60px;
+}
+
+.section-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: rgba(99,102,241,0.08);
+  padding: 6px 14px;
+  border-radius: var(--radius-full);
+  margin-bottom: 20px;
+}
+
+.section-title {
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  font-weight: 800;
+  letter-spacing: -1px;
+  line-height: 1.15;
+  color: var(--text-primary);
+  margin-bottom: 16px;
+}
+
+.section-subtitle {
+  font-size: clamp(1rem, 2vw, 1.25rem);
+  color: var(--text-secondary);
+  font-weight: 400;
+  max-width: 600px;
+  line-height: 1.7;
+}
+
+/* ============================================
+   FADE IN ON SCROLL
+   ============================================ */
+
+.fade-in {
+  opacity: 0;
+  transform: translateY(30px);
+  transition: opacity 0.6s var(--ease), transform 0.6s var(--ease);
+}
+
+.fade-in.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.fade-in-delay-1 { transition-delay: 0.1s; }
+.fade-in-delay-2 { transition-delay: 0.2s; }
+.fade-in-delay-3 { transition-delay: 0.3s; }
+.fade-in-delay-4 { transition-delay: 0.4s; }
+
+/* ============================================
+   SCREEN 1: LANDING / HERO
+   ============================================ */
+
+#hero {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  background: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary-mid) 50%, #0e4166 100%);
+  position: relative;
+  overflow: hidden;
+  padding: 120px 24px 80px;
+}
+
+#hero::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  right: -30%;
+  width: 80vw;
+  height: 80vw;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(99,102,241,0.15) 0%, transparent 70%);
+  animation: float 20s infinite ease-in-out;
+}
+
+#hero::after {
+  content: '';
+  position: absolute;
+  bottom: -40%;
+  left: -20%;
+  width: 60vw;
+  height: 60vw;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(16,185,129,0.1) 0%, transparent 70%);
+  animation: float 25s infinite ease-in-out reverse;
+}
+
+@keyframes float {
+  0%, 100% { transform: translate(0, 0); }
+  33% { transform: translate(30px, -30px); }
+  66% { transform: translate(-20px, 20px); }
+}
+
+.hero-content {
+  position: relative;
+  z-index: 2;
+  max-width: 800px;
+}
+
+.hero-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255,255,255,0.1);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255,255,255,0.15);
+  padding: 8px 20px;
+  border-radius: var(--radius-full);
+  color: rgba(255,255,255,0.9);
+  font-size: 0.85rem;
+  font-weight: 500;
+  margin-bottom: 32px;
+}
+
+.hero-badge .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: pulse-dot 2s infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.3); }
+}
+
+.hero-title {
+  font-size: clamp(2.5rem, 7vw, 4.5rem);
+  font-weight: 900;
+  color: #fff;
+  letter-spacing: -2px;
+  line-height: 1.1;
+  margin-bottom: 24px;
+}
+
+.hero-title .gradient-text {
+  background: linear-gradient(135deg, var(--accent-light), var(--success));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.hero-description {
+  font-size: clamp(1.05rem, 2.5vw, 1.3rem);
+  color: rgba(255,255,255,0.7);
+  max-width: 560px;
+  margin: 0 auto 40px;
+  line-height: 1.8;
+  font-weight: 300;
+}
+
+.hero-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 600;
+  padding: 16px 40px;
+  border: none;
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  transition: all 0.3s var(--ease);
+  position: relative;
+  overflow: hidden;
+  text-decoration: none;
+}
+
+.hero-cta::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, transparent, rgba(255,255,255,0.1));
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+.hero-cta:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 40px rgba(99,102,241,0.4);
+}
+
+.hero-cta:hover::before {
+  opacity: 1;
+}
+
+.hero-cta svg {
+  width: 20px;
+  height: 20px;
+  transition: transform 0.3s var(--ease);
+}
+
+.hero-cta:hover svg {
+  transform: translateX(-4px);
+}
+
+.hero-stats {
+  display: flex;
+  justify-content: center;
+  gap: 48px;
+  margin-top: 60px;
+  padding-top: 40px;
+  border-top: 1px solid rgba(255,255,255,0.1);
+}
+
+.hero-stat {
+  text-align: center;
+}
+
+.hero-stat-number {
+  font-size: 2rem;
+  font-weight: 800;
+  color: #fff;
+  letter-spacing: -1px;
+}
+
+.hero-stat-label {
+  font-size: 0.85rem;
+  color: rgba(255,255,255,0.5);
+  margin-top: 4px;
+}
+
+@media (max-width: 600px) {
+  .hero-stats { gap: 24px; flex-wrap: wrap; }
+}
+
+/* ============================================
+   FEATURES SECTION
+   ============================================ */
+
+#features {
+  background: var(--bg);
+  padding: 100px 24px;
+}
+
+.features-container {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.features-header {
+  text-align: center;
+  margin-bottom: 64px;
+}
+
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 24px;
+}
+
+.feature-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 32px;
+  transition: all 0.3s var(--ease);
+  position: relative;
+  overflow: hidden;
+}
+
+.feature-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--accent), var(--success));
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+.feature-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+}
+
+.feature-card:hover::before {
+  opacity: 1;
+}
+
+.feature-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-md);
+  background: rgba(99,102,241,0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20px;
+  color: var(--accent);
+}
+
+.feature-icon svg {
+  width: 24px;
+  height: 24px;
+}
+
+.feature-card h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin-bottom: 10px;
+  color: var(--text-primary);
+}
+
+.feature-card p {
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  line-height: 1.7;
+}
+
+/* ============================================
+   SCREEN 2: ONBOARDING WIZARD
+   ============================================ */
+
+#onboarding {
+  background: var(--bg-secondary);
+  padding: 100px 24px;
+  min-height: 100vh;
+}
+
+.onboarding-container {
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.onboarding-header {
+  text-align: center;
+  margin-bottom: 48px;
+}
+
+/* Progress bar */
+.progress-bar-container {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-bottom: 48px;
+  padding: 0 20px;
+}
+
+.progress-step {
+  display: flex;
+  align-items: center;
+  flex: 1;
+}
+
+.progress-step:last-child {
+  flex: 0;
+}
+
+.progress-dot {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--bg);
+  border: 2px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--text-tertiary);
+  transition: all 0.4s var(--ease-spring);
+  position: relative;
+  z-index: 2;
+  flex-shrink: 0;
+}
+
+.progress-dot.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  transform: scale(1.15);
+  box-shadow: 0 0 0 4px rgba(99,102,241,0.2);
+}
+
+.progress-dot.completed {
+  background: var(--success);
+  border-color: var(--success);
+  color: #fff;
+}
+
+.progress-line {
+  flex: 1;
+  height: 2px;
+  background: var(--border);
+  position: relative;
+}
+
+.progress-line-fill {
+  position: absolute;
+  top: 0;
+  right: 0;
+  height: 100%;
+  background: var(--success);
+  transition: width 0.5s var(--ease);
+  width: 0%;
+}
+
+.progress-line-fill.filled {
+  width: 100%;
+}
+
+/* Wizard card */
+.wizard-card {
+  background: var(--bg);
+  border-radius: var(--radius-xl);
+  padding: 40px;
+  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--border-light);
+  position: relative;
+  overflow: hidden;
+}
+
+.wizard-step {
+  display: none;
+  animation: slideIn 0.4s var(--ease);
+}
+
+.wizard-step.active {
+  display: block;
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-20px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+.wizard-step-title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.wizard-step-desc {
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+  margin-bottom: 32px;
+}
+
+/* Input styles */
+.input-group {
+  margin-bottom: 24px;
+}
+
+.input-group label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.input-field {
+  width: 100%;
+  padding: 14px 18px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: 1rem;
+  font-family: inherit;
+  color: var(--text-primary);
+  background: var(--bg);
+  transition: all 0.2s var(--ease);
+  outline: none;
+  direction: rtl;
+}
+
+.input-field:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.12);
+}
+
+.input-field.en {
+  direction: ltr;
+  text-align: left;
+  font-family: 'Inter', sans-serif;
+}
+
+.input-hint {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+  margin-top: 6px;
+}
+
+.input-hint.success {
+  color: var(--success);
+}
+
+.input-hint.error {
+  color: var(--danger);
+}
+
+/* Business type cards */
+.type-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+@media (max-width: 500px) {
+  .type-cards-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+.type-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 12px;
+  border: 2px solid var(--border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: all 0.2s var(--ease);
+  background: var(--bg);
+  text-align: center;
+}
+
+.type-card:hover {
+  border-color: var(--accent-light);
+  background: rgba(99,102,241,0.03);
+}
+
+.type-card.selected {
+  border-color: var(--accent);
+  background: rgba(99,102,241,0.06);
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.12);
+}
+
+.type-card svg {
+  width: 28px;
+  height: 28px;
+  color: var(--accent);
+}
+
+.type-card span {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Services list */
+.service-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-md);
+  margin-bottom: 12px;
+  animation: fadeInUp 0.3s var(--ease);
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.service-item .service-name {
+  flex: 1;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.service-item .service-price {
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 0.95rem;
+  direction: ltr;
+}
+
+.service-item .service-duration {
+  color: var(--text-tertiary);
+  font-size: 0.8rem;
+}
+
+.service-item .remove-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(239,68,68,0.08);
+  color: var(--danger);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.service-item .remove-btn:hover {
+  background: rgba(239,68,68,0.15);
+}
+
+.add-service-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  padding: 14px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius-md);
+  background: none;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.add-service-btn:hover {
+  border-color: var(--accent);
+  background: rgba(99,102,241,0.03);
+}
+
+/* Working hours */
+.hours-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.hours-row:last-child { border-bottom: none; }
+
+.hours-day {
+  width: 80px;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.hours-toggle {
+  position: relative;
+  width: 44px;
+  height: 24px;
+  border-radius: var(--radius-full);
+  background: var(--border);
+  cursor: pointer;
+  transition: background 0.3s;
+  flex-shrink: 0;
+}
+
+.hours-toggle.active {
+  background: var(--accent);
+}
+
+.hours-toggle::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.3s var(--ease-spring);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+}
+
+.hours-toggle.active::after {
+  transform: translateX(-20px);
+}
+
+.hours-times {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  direction: ltr;
+}
+
+.hours-time-input {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-family: 'Inter', sans-serif;
+  width: 80px;
+  text-align: center;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.hours-time-input:focus {
+  border-color: var(--accent);
+}
+
+/* Theme selection */
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.theme-option {
+  border: 2px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  cursor: pointer;
+  transition: all 0.3s var(--ease);
+}
+
+.theme-option:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+.theme-option.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.15);
+}
+
+.theme-preview {
+  height: 100px;
+  position: relative;
+}
+
+.theme-option-label {
+  padding: 12px;
+  text-align: center;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+/* Wizard buttons */
+.wizard-actions {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 32px;
+  gap: 12px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 28px;
+  border: none;
+  border-radius: var(--radius-full);
+  font-size: 0.95rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.2s var(--ease);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-primary:hover {
+  background: var(--accent-dark);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(99,102,241,0.3);
+}
+
+.btn-secondary {
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+}
+
+.btn-secondary:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* ============================================
+   SCREEN 3: DASHBOARD
+   ============================================ */
+
+#dashboard {
+  background: var(--bg-secondary);
+  padding: 80px 24px 100px;
+  min-height: 100vh;
+}
+
+.dashboard-container {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.dashboard-header {
+  text-align: center;
+  margin-bottom: 48px;
+}
+
+.dashboard-layout {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 24px;
+  background: var(--bg);
+  border-radius: var(--radius-xl);
+  overflow: hidden;
+  box-shadow: var(--shadow-lg);
+  border: 1px solid var(--border-light);
+  min-height: 600px;
+}
+
+@media (max-width: 900px) {
+  .dashboard-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Sidebar */
+.dash-sidebar {
+  background: var(--primary-dark);
+  padding: 28px 16px;
+  color: #fff;
+}
+
+@media (max-width: 900px) {
+  .dash-sidebar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 16px;
+  }
+}
+
+.dash-sidebar-logo {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 8px;
+  padding: 0 12px;
+}
+
+.dash-sidebar-business {
+  font-size: 0.8rem;
+  color: rgba(255,255,255,0.5);
+  margin-bottom: 32px;
+  padding: 0 12px;
+}
+
+.dash-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  color: rgba(255,255,255,0.6);
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-bottom: 4px;
+}
+
+.dash-nav-item:hover {
+  background: rgba(255,255,255,0.08);
+  color: rgba(255,255,255,0.9);
+}
+
+.dash-nav-item.active {
+  background: rgba(99,102,241,0.2);
+  color: #fff;
+}
+
+.dash-nav-item svg {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 900px) {
+  .dash-sidebar-logo,
+  .dash-sidebar-business { display: none; }
+  .dash-nav-item {
+    flex: 0 0 auto;
+    margin-bottom: 0;
+    padding: 10px 14px;
+    font-size: 0.8rem;
+  }
+}
+
+/* Dashboard content */
+.dash-content {
+  padding: 32px;
+}
+
+.dash-greeting {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.dash-date {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  margin-bottom: 32px;
+}
+
+/* Stats cards */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.stat-card {
+  background: var(--bg-secondary);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  border: 1px solid var(--border-light);
+  transition: all 0.2s;
+}
+
+.stat-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-md);
+}
+
+.stat-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 12px;
+}
+
+.stat-icon.blue { background: rgba(99,102,241,0.1); color: var(--accent); }
+.stat-icon.green { background: rgba(16,185,129,0.1); color: var(--success); }
+.stat-icon.orange { background: rgba(245,158,11,0.1); color: var(--warning); }
+
+.stat-icon svg { width: 20px; height: 20px; }
+
+.stat-value {
+  font-size: 1.75rem;
+  font-weight: 800;
+  letter-spacing: -1px;
+  margin-bottom: 2px;
+}
+
+.stat-label {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+}
+
+/* Appointments list */
+.appointments-section-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.appointment-item {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-light);
+  margin-bottom: 8px;
+  transition: all 0.2s;
+  background: var(--bg);
+}
+
+.appointment-item:hover {
+  border-color: var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+.appointment-time {
+  text-align: center;
+  min-width: 56px;
+  flex-shrink: 0;
+}
+
+.appointment-time-value {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent);
+  font-family: 'Inter', sans-serif;
+  direction: ltr;
+}
+
+.appointment-time-period {
+  font-size: 0.7rem;
+  color: var(--text-tertiary);
+}
+
+.appointment-divider {
+  width: 3px;
+  height: 36px;
+  border-radius: 2px;
+  background: var(--accent);
+  opacity: 0.3;
+  flex-shrink: 0;
+}
+
+.appointment-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.appointment-name {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin-bottom: 2px;
+}
+
+.appointment-service {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+}
+
+.appointment-status {
+  padding: 4px 12px;
+  border-radius: var(--radius-full);
+  font-size: 0.75rem;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.appointment-status.confirmed {
+  background: var(--success-light);
+  color: var(--success);
+}
+
+.appointment-status.pending {
+  background: rgba(245,158,11,0.1);
+  color: var(--warning);
+}
+
+/* ============================================
+   SCREEN 4: CUSTOMER BOOKING PAGE
+   ============================================ */
+
+#booking {
+  background: var(--bg);
+  padding: 80px 24px 100px;
+  min-height: 100vh;
+}
+
+.booking-container {
+  max-width: 560px;
+  margin: 0 auto;
+}
+
+.booking-header-section {
+  text-align: center;
+  margin-bottom: 48px;
+}
+
+.booking-card {
+  background: var(--bg);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-xl);
+  border: 1px solid var(--border-light);
+  overflow: hidden;
+}
+
+/* Business header in booking */
+.booking-business-header {
+  background: linear-gradient(135deg, var(--primary-dark), var(--primary-mid));
+  padding: 32px;
+  text-align: center;
+  color: #fff;
+}
+
+.booking-avatar {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.15);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 16px;
+  font-size: 1.5rem;
+  font-weight: 700;
+  border: 2px solid rgba(255,255,255,0.2);
+}
+
+.booking-business-name {
+  font-size: 1.3rem;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.booking-business-type {
+  font-size: 0.85rem;
+  color: rgba(255,255,255,0.6);
+}
+
+/* Booking steps */
+.booking-body {
+  padding: 32px;
+}
+
+.booking-step {
+  display: none;
+}
+
+.booking-step.active {
+  display: block;
+  animation: fadeInUp 0.3s var(--ease);
+}
+
+.booking-step-label {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+  font-weight: 500;
+  margin-bottom: 16px;
+}
+
+/* Service selection */
+.service-select-card {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+  border: 2px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-bottom: 12px;
+  cursor: pointer;
+  transition: all 0.2s var(--ease);
+}
+
+.service-select-card:hover {
+  border-color: var(--accent-light);
+  background: rgba(99,102,241,0.02);
+}
+
+.service-select-card.selected {
+  border-color: var(--accent);
+  background: rgba(99,102,241,0.04);
+}
+
+.service-select-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-md);
+  background: rgba(99,102,241,0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.service-select-icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+.service-select-info {
+  flex: 1;
+}
+
+.service-select-name {
+  font-weight: 600;
+  font-size: 0.95rem;
+  margin-bottom: 2px;
+}
+
+.service-select-meta {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+}
+
+.service-select-price {
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 1rem;
+  flex-shrink: 0;
+  direction: ltr;
+}
+
+/* Calendar */
+.calendar-widget {
+  margin-bottom: 24px;
+}
+
+.calendar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.calendar-month {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.calendar-nav-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  color: var(--text-secondary);
+}
+
+.calendar-nav-btn:hover {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.calendar-nav-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+  text-align: center;
+}
+
+.calendar-day-name {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  padding: 8px 0;
+}
+
+.calendar-day {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  color: var(--text-primary);
+  border: none;
+  background: none;
+  font-family: inherit;
+}
+
+.calendar-day:hover:not(.disabled):not(.selected) {
+  background: var(--bg-secondary);
+}
+
+.calendar-day.selected {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+
+.calendar-day.today {
+  border: 2px solid var(--accent);
+}
+
+.calendar-day.disabled {
+  color: var(--text-tertiary);
+  opacity: 0.3;
+  cursor: default;
+}
+
+.calendar-day.other-month {
+  color: var(--text-tertiary);
+  opacity: 0.3;
+}
+
+/* Time slots */
+.time-slots-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+@media (max-width: 400px) {
+  .time-slots-grid { grid-template-columns: repeat(2, 1fr); }
+}
+
+.time-slot {
+  padding: 12px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  text-align: center;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s var(--ease);
+  background: var(--bg);
+  font-family: 'Inter', sans-serif;
+  direction: ltr;
+  color: var(--text-primary);
+}
+
+.time-slot:hover {
+  border-color: var(--accent-light);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-sm);
+}
+
+.time-slot.selected {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.time-slot.unavailable {
+  opacity: 0.3;
+  cursor: not-allowed;
+  text-decoration: line-through;
+}
+
+/* Customer form */
+.booking-form-group {
+  margin-bottom: 20px;
+}
+
+.booking-form-group label {
+  display: block;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.booking-form-group input,
+.booking-form-group textarea {
+  width: 100%;
+  padding: 14px 18px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: 1rem;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.2s;
+  background: var(--bg);
+  color: var(--text-primary);
+}
+
+.booking-form-group input:focus,
+.booking-form-group textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+}
+
+.booking-form-group textarea {
+  resize: vertical;
+  min-height: 80px;
+}
+
+.booking-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 28px;
+}
+
+.booking-actions .btn {
+  flex: 1;
+  justify-content: center;
+}
+
+/* ============================================
+   SCREEN 5: CONFIRMATION
+   ============================================ */
+
+#confirmation {
+  background: var(--bg-secondary);
+  padding: 80px 24px 100px;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.confirmation-container {
+  max-width: 480px;
+  width: 100%;
+  text-align: center;
+}
+
+.confirmation-card {
+  background: var(--bg);
+  border-radius: var(--radius-xl);
+  padding: 48px 32px;
+  box-shadow: var(--shadow-xl);
+  border: 1px solid var(--border-light);
+}
+
+/* Success animation */
+.success-checkmark {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--success-light);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 24px;
+  animation: scaleIn 0.5s var(--ease-spring);
+}
+
+@keyframes scaleIn {
+  from { transform: scale(0); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+.success-checkmark svg {
+  width: 40px;
+  height: 40px;
+  color: var(--success);
+  animation: checkDraw 0.6s 0.3s var(--ease) both;
+}
+
+@keyframes checkDraw {
+  from { stroke-dashoffset: 100; opacity: 0; }
+  to { stroke-dashoffset: 0; opacity: 1; }
+}
+
+.confirmation-title {
+  font-size: 1.5rem;
+  font-weight: 800;
+  margin-bottom: 8px;
+  color: var(--text-primary);
+}
+
+.confirmation-subtitle {
+  color: var(--text-secondary);
+  margin-bottom: 32px;
+  font-size: 0.95rem;
+}
+
+.confirmation-details {
+  background: var(--bg-secondary);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  margin-bottom: 32px;
+  text-align: right;
+}
+
+.confirmation-detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.confirmation-detail-row:last-child {
+  border-bottom: none;
+}
+
+.confirmation-detail-label {
+  font-size: 0.85rem;
+  color: var(--text-tertiary);
+}
+
+.confirmation-detail-value {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.confirmation-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.btn-outline {
+  background: transparent;
+  border: 1.5px solid var(--border);
+  color: var(--text-primary);
+}
+
+.btn-outline:hover {
+  background: var(--bg-secondary);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ============================================
+   FOOTER
+   ============================================ */
+
+.proto-footer {
+  text-align: center;
+  padding: 40px 24px;
+  background: var(--primary-dark);
+  color: rgba(255,255,255,0.4);
+  font-size: 0.8rem;
+}
+
+.proto-footer a {
+  color: var(--accent-light);
+  text-decoration: none;
+}
+
+/* ============================================
+   UTILITIES
+   ============================================ */
+
+.text-center { text-align: center; }
+.mt-2 { margin-top: 8px; }
+.mt-4 { margin-top: 16px; }
+.mb-4 { margin-bottom: 16px; }
+
+/* Skeleton loading */
+.skeleton {
+  background: linear-gradient(90deg, var(--bg-secondary) 25%, var(--bg-tertiary) 50%, var(--bg-secondary) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+  border-radius: var(--radius-sm);
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Scroll reveal */
+@media (prefers-reduced-motion: reduce) {
+  .fade-in { opacity: 1; transform: none; transition: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================================
+     NAVIGATION
+     ============================================ -->
+<nav class="nav-section-selector" id="mainNav">
+  <div class="nav-inner">
+    <div class="nav-logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+        <line x1="16" y1="2" x2="16" y2="6"/>
+        <line x1="8" y1="2" x2="8" y2="6"/>
+        <line x1="3" y1="10" x2="21" y2="10"/>
+      </svg>
+      PickTime
+    </div>
+    <ul class="nav-links">
+      <li><a href="#hero" class="active">ראשי</a></li>
+      <li><a href="#features">תכונות</a></li>
+      <li><a href="#onboarding">הרשמה</a></li>
+      <li><a href="#dashboard">לוח בקרה</a></li>
+      <li><a href="#booking">הזמנת תור</a></li>
+      <li><a href="#confirmation">אישור</a></li>
+    </ul>
+  </div>
+</nav>
+
+<!-- ============================================
+     SCREEN 1: HERO
+     ============================================ -->
+<section id="hero" class="section-screen">
+  <div class="hero-content">
+    <div class="hero-badge fade-in">
+      <span class="dot"></span>
+      חדש — כל מה שהעסק שלך צריך במקום אחד
+    </div>
+    <h1 class="hero-title fade-in fade-in-delay-1">
+      ניהול תורים<br>
+      <span class="gradient-text">בלי כאב ראש</span>
+    </h1>
+    <p class="hero-description fade-in fade-in-delay-2">
+      הלקוחות שלך קובעים תורים בלחיצה. אתה מנהל הכל ממקום אחד.
+      פשוט, יפה, וחכם — כי העסק שלך מגיע ליותר.
+    </p>
+    <a href="#onboarding" class="hero-cta fade-in fade-in-delay-3">
+      צור את העסק שלך בחינם
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="19" y1="12" x2="5" y2="12"/>
+        <polyline points="12 19 5 12 12 5"/>
+      </svg>
+    </a>
+    <div class="hero-stats fade-in fade-in-delay-4">
+      <div class="hero-stat">
+        <div class="hero-stat-number">2,400+</div>
+        <div class="hero-stat-label">עסקים פעילים</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-number">150K+</div>
+        <div class="hero-stat-label">תורים בחודש</div>
+      </div>
+      <div class="hero-stat">
+        <div class="hero-stat-number">4.9</div>
+        <div class="hero-stat-label">דירוג ממוצע</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================
+     FEATURES SECTION
+     ============================================ -->
+<section id="features">
+  <div class="features-container">
+    <div class="features-header">
+      <span class="section-label fade-in">למה PickTime</span>
+      <h2 class="section-title fade-in fade-in-delay-1">הכל פשוט מכאן</h2>
+      <p class="section-subtitle fade-in fade-in-delay-2" style="margin: 0 auto;">
+        כלים חכמים שנבנו בדיוק בשביל עסקים קטנים בישראל
+      </p>
+    </div>
+    <div class="features-grid">
+      <!-- Feature 1 -->
+      <div class="feature-card fade-in">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/>
+            <path d="M12 6v6l4 2"/>
+          </svg>
+        </div>
+        <h3>הזמנה אונליין 24/7</h3>
+        <p>הלקוחות שלך קובעים תורים בכל שעה, מכל מקום. בלי טלפונים, בלי ווטסאפ. הכל אוטומטי.</p>
+      </div>
+      <!-- Feature 2 -->
+      <div class="feature-card fade-in fade-in-delay-1">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72 12.84 12.84 0 00.7 2.81 2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45 12.84 12.84 0 002.81.7A2 2 0 0122 16.92z"/>
+          </svg>
+        </div>
+        <h3>תזכורות אוטומטיות</h3>
+        <p>SMS ו-WhatsApp אוטומטי ללקוחות. פחות ביטולי רגע אחרון, יותר הכנסות.</p>
+      </div>
+      <!-- Feature 3 -->
+      <div class="feature-card fade-in fade-in-delay-2">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+            <line x1="8" y1="21" x2="16" y2="21"/>
+            <line x1="12" y1="17" x2="12" y2="21"/>
+          </svg>
+        </div>
+        <h3>דף עסקי מעוצב</h3>
+        <p>דף הזמנות מקצועי עם הלוגו שלך. שתף לינק וקבל הזמנות — בלי לבנות אתר.</p>
+      </div>
+      <!-- Feature 4 -->
+      <div class="feature-card fade-in">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="1" x2="12" y2="23"/>
+            <path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>
+          </svg>
+        </div>
+        <h3>תשלומים ודוחות</h3>
+        <p>קבל תשלום מראש, עקוב אחרי הכנסות, וקבל דוחות חכמים — הכל במקום אחד.</p>
+      </div>
+      <!-- Feature 5 -->
+      <div class="feature-card fade-in fade-in-delay-1">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 00-3-3.87"/>
+            <path d="M16 3.13a4 4 0 010 7.75"/>
+          </svg>
+        </div>
+        <h3>ניהול לקוחות</h3>
+        <p>מאגר לקוחות חכם. היסטוריית ביקורים, העדפות, והערות — שתמיד תזכור.</p>
+      </div>
+      <!-- Feature 6 -->
+      <div class="feature-card fade-in fade-in-delay-2">
+        <div class="feature-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="5" y="2" width="14" height="20" rx="2" ry="2"/>
+            <line x1="12" y1="18" x2="12.01" y2="18"/>
+          </svg>
+        </div>
+        <h3>מותאם לנייד</h3>
+        <p>עובד מושלם מהטלפון — גם לך וגם ללקוחות. חוויה חלקה בכל מסך.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================
+     SCREEN 2: ONBOARDING WIZARD
+     ============================================ -->
+<section id="onboarding" class="section-screen">
+  <div class="onboarding-container">
+    <div class="onboarding-header">
+      <span class="section-label fade-in">הרשמה</span>
+      <h2 class="section-title fade-in fade-in-delay-1">בוא נקים את העסק שלך</h2>
+      <p class="section-subtitle fade-in fade-in-delay-2" style="margin: 0 auto;">
+        5 צעדים פשוטים — פחות מ-3 דקות
+      </p>
+    </div>
+
+    <!-- Progress bar -->
+    <div class="progress-bar-container fade-in">
+      <div class="progress-step">
+        <div class="progress-dot active" data-step="1">1</div>
+        <div class="progress-line"><div class="progress-line-fill"></div></div>
+      </div>
+      <div class="progress-step">
+        <div class="progress-dot" data-step="2">2</div>
+        <div class="progress-line"><div class="progress-line-fill"></div></div>
+      </div>
+      <div class="progress-step">
+        <div class="progress-dot" data-step="3">3</div>
+        <div class="progress-line"><div class="progress-line-fill"></div></div>
+      </div>
+      <div class="progress-step">
+        <div class="progress-dot" data-step="4">4</div>
+        <div class="progress-line"><div class="progress-line-fill"></div></div>
+      </div>
+      <div class="progress-step">
+        <div class="progress-dot" data-step="5">5</div>
+      </div>
+    </div>
+
+    <!-- Wizard card -->
+    <div class="wizard-card fade-in">
+      <!-- Step 1: Business Name -->
+      <div class="wizard-step active" data-step="1">
+        <h3 class="wizard-step-title">פרטי העסק</h3>
+        <p class="wizard-step-desc">ספר לנו קצת על העסק שלך</p>
+        <div class="input-group">
+          <label>שם העסק</label>
+          <input type="text" class="input-field" placeholder="למשל: הסטודיו של דנה" id="businessName">
+        </div>
+        <div class="input-group">
+          <label>כתובת דף ההזמנות (באנגלית)</label>
+          <input type="text" class="input-field en" placeholder="dana-studio" id="businessUsername" oninput="checkUsername(this)">
+          <div class="input-hint" id="usernameHint">picktime.co.il/dana-studio</div>
+        </div>
+        <div class="input-group">
+          <label>טלפון</label>
+          <input type="tel" class="input-field en" placeholder="050-1234567" dir="ltr" style="text-align:left;">
+        </div>
+        <div class="wizard-actions">
+          <div></div>
+          <button class="btn btn-primary" onclick="goToStep(2)">
+            המשך
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Step 2: Business Type -->
+      <div class="wizard-step" data-step="2">
+        <h3 class="wizard-step-title">סוג העסק</h3>
+        <p class="wizard-step-desc">בחר את הקטגוריה שמתאימה לך</p>
+        <div class="type-cards-grid">
+          <div class="type-card" onclick="selectType(this)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5.25 2.25h13.5L21 7.5H3L5.25 2.25z"/>
+              <path d="M3 7.5v.75C3 9.768 4.232 11 5.75 11S8.5 9.768 8.5 8.25V7.5"/>
+              <path d="M8.5 7.5v.75c0 1.518 1.232 2.75 2.75 2.75s2.75-1.232 2.75-2.75V7.5"/>
+              <path d="M14 7.5v.75c0 1.518 1.232 2.75 2.75 2.75S19.5 9.768 19.5 8.25V7.5"/>
+              <path d="M3 7.5v.75C3 9.768 4.232 11 5.75 11"/>
+              <path d="M5 11v10.5h14V11"/>
+            </svg>
+            <span>מספרה / ברבר</span>
+          </div>
+          <div class="type-card" onclick="selectType(this)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/>
+            </svg>
+            <span>ציפורניים / ביוטי</span>
+          </div>
+          <div class="type-card" onclick="selectType(this)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 8h1a4 4 0 010 8h-1"/>
+              <path d="M2 8h16v9a4 4 0 01-4 4H6a4 4 0 01-4-4V8z"/>
+              <line x1="6" y1="1" x2="6" y2="4"/>
+              <line x1="10" y1="1" x2="10" y2="4"/>
+              <line x1="14" y1="1" x2="14" y2="4"/>
+            </svg>
+            <span>מאמן כושר</span>
+          </div>
+          <div class="type-card" onclick="selectType(this)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z"/>
+              <path d="M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z"/>
+            </svg>
+            <span>מורה פרטי</span>
+          </div>
+          <div class="type-card" onclick="selectType(this)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+            </svg>
+            <span>טיפול / תרפיה</span>
+          </div>
+          <div class="type-card" onclick="selectType(this)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="2" y1="12" x2="22" y2="12"/>
+              <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/>
+            </svg>
+            <span>אחר</span>
+          </div>
+        </div>
+        <div class="wizard-actions">
+          <button class="btn btn-secondary" onclick="goToStep(1)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            חזרה
+          </button>
+          <button class="btn btn-primary" onclick="goToStep(3)">
+            המשך
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Step 3: Services -->
+      <div class="wizard-step" data-step="3">
+        <h3 class="wizard-step-title">השירותים שלך</h3>
+        <p class="wizard-step-desc">הוסף את השירותים שאתה מציע</p>
+        <div id="servicesList">
+          <div class="service-item">
+            <div style="flex:1">
+              <div class="service-name">תספורת גברים</div>
+              <div class="service-duration">30 דקות</div>
+            </div>
+            <div class="service-price">₪60</div>
+            <button class="remove-btn" onclick="this.closest('.service-item').remove()">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+          <div class="service-item">
+            <div style="flex:1">
+              <div class="service-name">תספורת + זקן</div>
+              <div class="service-duration">45 דקות</div>
+            </div>
+            <div class="service-price">₪80</div>
+            <button class="remove-btn" onclick="this.closest('.service-item').remove()">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+          <div class="service-item">
+            <div style="flex:1">
+              <div class="service-name">צבע שיער</div>
+              <div class="service-duration">60 דקות</div>
+            </div>
+            <div class="service-price">₪120</div>
+            <button class="remove-btn" onclick="this.closest('.service-item').remove()">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <button class="add-service-btn" onclick="addService()">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          הוסף שירות
+        </button>
+        <div class="wizard-actions">
+          <button class="btn btn-secondary" onclick="goToStep(2)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            חזרה
+          </button>
+          <button class="btn btn-primary" onclick="goToStep(4)">
+            המשך
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Step 4: Working Hours -->
+      <div class="wizard-step" data-step="4">
+        <h3 class="wizard-step-title">שעות פעילות</h3>
+        <p class="wizard-step-desc">הגדר מתי העסק שלך פתוח</p>
+        <div class="hours-list">
+          <div class="hours-row">
+            <div class="hours-day">ראשון</div>
+            <div class="hours-toggle active" onclick="this.classList.toggle('active')"></div>
+            <div class="hours-times">
+              <input type="text" class="hours-time-input" value="09:00">
+              <span>—</span>
+              <input type="text" class="hours-time-input" value="19:00">
+            </div>
+          </div>
+          <div class="hours-row">
+            <div class="hours-day">שני</div>
+            <div class="hours-toggle active" onclick="this.classList.toggle('active')"></div>
+            <div class="hours-times">
+              <input type="text" class="hours-time-input" value="09:00">
+              <span>—</span>
+              <input type="text" class="hours-time-input" value="19:00">
+            </div>
+          </div>
+          <div class="hours-row">
+            <div class="hours-day">שלישי</div>
+            <div class="hours-toggle active" onclick="this.classList.toggle('active')"></div>
+            <div class="hours-times">
+              <input type="text" class="hours-time-input" value="09:00">
+              <span>—</span>
+              <input type="text" class="hours-time-input" value="19:00">
+            </div>
+          </div>
+          <div class="hours-row">
+            <div class="hours-day">רביעי</div>
+            <div class="hours-toggle active" onclick="this.classList.toggle('active')"></div>
+            <div class="hours-times">
+              <input type="text" class="hours-time-input" value="09:00">
+              <span>—</span>
+              <input type="text" class="hours-time-input" value="19:00">
+            </div>
+          </div>
+          <div class="hours-row">
+            <div class="hours-day">חמישי</div>
+            <div class="hours-toggle active" onclick="this.classList.toggle('active')"></div>
+            <div class="hours-times">
+              <input type="text" class="hours-time-input" value="09:00">
+              <span>—</span>
+              <input type="text" class="hours-time-input" value="20:00">
+            </div>
+          </div>
+          <div class="hours-row">
+            <div class="hours-day">שישי</div>
+            <div class="hours-toggle active" onclick="this.classList.toggle('active')"></div>
+            <div class="hours-times">
+              <input type="text" class="hours-time-input" value="09:00">
+              <span>—</span>
+              <input type="text" class="hours-time-input" value="14:00">
+            </div>
+          </div>
+          <div class="hours-row">
+            <div class="hours-day">שבת</div>
+            <div class="hours-toggle" onclick="this.classList.toggle('active')"></div>
+            <div class="hours-times">
+              <input type="text" class="hours-time-input" value="" placeholder="—" disabled>
+              <span>—</span>
+              <input type="text" class="hours-time-input" value="" placeholder="—" disabled>
+            </div>
+          </div>
+        </div>
+        <div class="wizard-actions">
+          <button class="btn btn-secondary" onclick="goToStep(3)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            חזרה
+          </button>
+          <button class="btn btn-primary" onclick="goToStep(5)">
+            המשך
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- Step 5: Theme -->
+      <div class="wizard-step" data-step="5">
+        <h3 class="wizard-step-title">בחר עיצוב</h3>
+        <p class="wizard-step-desc">איך דף ההזמנות שלך ייראה?</p>
+        <div class="theme-grid">
+          <div class="theme-option selected" onclick="selectTheme(this)">
+            <div class="theme-preview" style="background: linear-gradient(135deg, #1a1a2e, #16213e);"></div>
+            <div class="theme-option-label">כחול כהה</div>
+          </div>
+          <div class="theme-option" onclick="selectTheme(this)">
+            <div class="theme-preview" style="background: linear-gradient(135deg, #6366f1, #8b5cf6);"></div>
+            <div class="theme-option-label">סגול</div>
+          </div>
+          <div class="theme-option" onclick="selectTheme(this)">
+            <div class="theme-preview" style="background: linear-gradient(135deg, #10b981, #059669);"></div>
+            <div class="theme-option-label">ירוק</div>
+          </div>
+          <div class="theme-option" onclick="selectTheme(this)">
+            <div class="theme-preview" style="background: linear-gradient(135deg, #f59e0b, #d97706);"></div>
+            <div class="theme-option-label">כתום</div>
+          </div>
+          <div class="theme-option" onclick="selectTheme(this)">
+            <div class="theme-preview" style="background: linear-gradient(135deg, #ec4899, #be185d);"></div>
+            <div class="theme-option-label">ורוד</div>
+          </div>
+          <div class="theme-option" onclick="selectTheme(this)">
+            <div class="theme-preview" style="background: linear-gradient(135deg, #0f172a, #1e293b);"></div>
+            <div class="theme-option-label">שחור</div>
+          </div>
+        </div>
+        <div class="wizard-actions" style="margin-top:32px;">
+          <button class="btn btn-secondary" onclick="goToStep(4)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            חזרה
+          </button>
+          <button class="btn btn-primary" style="background:var(--success);" onclick="alert('העסק נוצר בהצלחה! 🎉')">
+            סיום — צור את העסק
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================
+     SCREEN 3: DASHBOARD
+     ============================================ -->
+<section id="dashboard">
+  <div class="dashboard-container">
+    <div class="dashboard-header">
+      <span class="section-label fade-in">לוח בקרה</span>
+      <h2 class="section-title fade-in fade-in-delay-1">הכל במבט אחד</h2>
+      <p class="section-subtitle fade-in fade-in-delay-2" style="margin:0 auto;">
+        ככה נראה לוח הבקרה של בעל העסק
+      </p>
+    </div>
+
+    <div class="dashboard-layout fade-in">
+      <!-- Sidebar -->
+      <div class="dash-sidebar">
+        <div class="dash-sidebar-logo">PickTime</div>
+        <div class="dash-sidebar-business">הסטודיו של דנה</div>
+        <div class="dash-nav-item active">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/>
+            <polyline points="9 22 9 12 15 12 15 22"/>
+          </svg>
+          ראשי
+        </div>
+        <div class="dash-nav-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+            <line x1="16" y1="2" x2="16" y2="6"/>
+            <line x1="8" y1="2" x2="8" y2="6"/>
+            <line x1="3" y1="10" x2="21" y2="10"/>
+          </svg>
+          יומן
+        </div>
+        <div class="dash-nav-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 00-3-3.87"/>
+            <path d="M16 3.13a4 4 0 010 7.75"/>
+          </svg>
+          לקוחות
+        </div>
+        <div class="dash-nav-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="20" x2="18" y2="10"/>
+            <line x1="12" y1="20" x2="12" y2="4"/>
+            <line x1="6" y1="20" x2="6" y2="14"/>
+          </svg>
+          דוחות
+        </div>
+        <div class="dash-nav-item">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+          </svg>
+          הגדרות
+        </div>
+      </div>
+
+      <!-- Content -->
+      <div class="dash-content">
+        <div class="dash-greeting">בוקר טוב, דנה ☀</div>
+        <div class="dash-date">יום ראשון, 29 במרץ 2026</div>
+
+        <!-- Stats -->
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-icon blue">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+                <line x1="16" y1="2" x2="16" y2="6"/>
+                <line x1="8" y1="2" x2="8" y2="6"/>
+                <line x1="3" y1="10" x2="21" y2="10"/>
+              </svg>
+            </div>
+            <div class="stat-value">8</div>
+            <div class="stat-label">תורים היום</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon green">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="12" y1="1" x2="12" y2="23"/>
+                <path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>
+              </svg>
+            </div>
+            <div class="stat-value">₪2,840</div>
+            <div class="stat-label">הכנסות השבוע</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-icon orange">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+                <circle cx="9" cy="7" r="4"/>
+              </svg>
+            </div>
+            <div class="stat-value">34</div>
+            <div class="stat-label">תורים השבוע</div>
+          </div>
+        </div>
+
+        <!-- Upcoming -->
+        <div class="appointments-section-title">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+          </svg>
+          התורים הקרובים
+        </div>
+
+        <div class="appointment-item">
+          <div class="appointment-time">
+            <div class="appointment-time-value">10:00</div>
+          </div>
+          <div class="appointment-divider"></div>
+          <div class="appointment-info">
+            <div class="appointment-name">יוסי כהן</div>
+            <div class="appointment-service">תספורת גברים · 30 דק׳</div>
+          </div>
+          <div class="appointment-status confirmed">מאושר</div>
+        </div>
+
+        <div class="appointment-item">
+          <div class="appointment-time">
+            <div class="appointment-time-value">10:30</div>
+          </div>
+          <div class="appointment-divider"></div>
+          <div class="appointment-info">
+            <div class="appointment-name">מיכל לוי</div>
+            <div class="appointment-service">תספורת + זקן · 45 דק׳</div>
+          </div>
+          <div class="appointment-status confirmed">מאושר</div>
+        </div>
+
+        <div class="appointment-item">
+          <div class="appointment-time">
+            <div class="appointment-time-value">11:15</div>
+          </div>
+          <div class="appointment-divider"></div>
+          <div class="appointment-info">
+            <div class="appointment-name">עומר דוד</div>
+            <div class="appointment-service">צבע שיער · 60 דק׳</div>
+          </div>
+          <div class="appointment-status pending">ממתין</div>
+        </div>
+
+        <div class="appointment-item">
+          <div class="appointment-time">
+            <div class="appointment-time-value">13:00</div>
+          </div>
+          <div class="appointment-divider"></div>
+          <div class="appointment-info">
+            <div class="appointment-name">רונית אברהם</div>
+            <div class="appointment-service">תספורת גברים · 30 דק׳</div>
+          </div>
+          <div class="appointment-status confirmed">מאושר</div>
+        </div>
+
+        <div class="appointment-item">
+          <div class="appointment-time">
+            <div class="appointment-time-value">14:00</div>
+          </div>
+          <div class="appointment-divider"></div>
+          <div class="appointment-info">
+            <div class="appointment-name">שי גולן</div>
+            <div class="appointment-service">תספורת + זקן · 45 דק׳</div>
+          </div>
+          <div class="appointment-status confirmed">מאושר</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================
+     SCREEN 4: CUSTOMER BOOKING
+     ============================================ -->
+<section id="booking">
+  <div class="booking-container">
+    <div class="booking-header-section">
+      <span class="section-label fade-in">דף הזמנות</span>
+      <h2 class="section-title fade-in fade-in-delay-1">מה הלקוחות רואים</h2>
+      <p class="section-subtitle fade-in fade-in-delay-2" style="margin:0 auto;">
+        ככה נראה הדף שבו לקוחות קובעים תור
+      </p>
+    </div>
+
+    <div class="booking-card fade-in">
+      <!-- Business header -->
+      <div class="booking-business-header">
+        <div class="booking-avatar">ד</div>
+        <div class="booking-business-name">הסטודיו של דנה</div>
+        <div class="booking-business-type">מספרה · תל אביב</div>
+      </div>
+
+      <div class="booking-body">
+        <!-- Booking Step 1: Service -->
+        <div class="booking-step active" data-booking-step="1">
+          <div class="booking-step-label">שלב 1 מתוך 4 — בחר שירות</div>
+
+          <div class="service-select-card" onclick="selectBookingService(this)">
+            <div class="service-select-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5.25 2.25h13.5L21 7.5H3L5.25 2.25z"/>
+                <path d="M5 11v10.5h14V11"/>
+              </svg>
+            </div>
+            <div class="service-select-info">
+              <div class="service-select-name">תספורת גברים</div>
+              <div class="service-select-meta">30 דקות</div>
+            </div>
+            <div class="service-select-price">₪60</div>
+          </div>
+
+          <div class="service-select-card" onclick="selectBookingService(this)">
+            <div class="service-select-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M5.25 2.25h13.5L21 7.5H3L5.25 2.25z"/>
+                <path d="M5 11v10.5h14V11"/>
+              </svg>
+            </div>
+            <div class="service-select-info">
+              <div class="service-select-name">תספורת + זקן</div>
+              <div class="service-select-meta">45 דקות</div>
+            </div>
+            <div class="service-select-price">₪80</div>
+          </div>
+
+          <div class="service-select-card" onclick="selectBookingService(this)">
+            <div class="service-select-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20.84 4.61a5.5 5.5 0 00-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 00-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 000-7.78z"/>
+              </svg>
+            </div>
+            <div class="service-select-info">
+              <div class="service-select-name">צבע שיער</div>
+              <div class="service-select-meta">60 דקות</div>
+            </div>
+            <div class="service-select-price">₪120</div>
+          </div>
+
+          <div class="booking-actions">
+            <button class="btn btn-primary" onclick="goToBookingStep(2)" style="flex:1;justify-content:center;">
+              המשך לבחירת תאריך
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Booking Step 2: Date & Time -->
+        <div class="booking-step" data-booking-step="2">
+          <div class="booking-step-label">שלב 2 מתוך 4 — בחר תאריך ושעה</div>
+
+          <div class="calendar-widget">
+            <div class="calendar-header">
+              <button class="calendar-nav-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+              </button>
+              <div class="calendar-month">מרץ 2026</div>
+              <button class="calendar-nav-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+              </button>
+            </div>
+            <div class="calendar-grid" id="calendarGrid">
+              <!-- Day names -->
+              <div class="calendar-day-name">א׳</div>
+              <div class="calendar-day-name">ב׳</div>
+              <div class="calendar-day-name">ג׳</div>
+              <div class="calendar-day-name">ד׳</div>
+              <div class="calendar-day-name">ה׳</div>
+              <div class="calendar-day-name">ו׳</div>
+              <div class="calendar-day-name">ש׳</div>
+              <!-- Days -->
+              <button class="calendar-day other-month disabled">22</button>
+              <button class="calendar-day other-month disabled">23</button>
+              <button class="calendar-day other-month disabled">24</button>
+              <button class="calendar-day other-month disabled">25</button>
+              <button class="calendar-day other-month disabled">26</button>
+              <button class="calendar-day other-month disabled">27</button>
+              <button class="calendar-day other-month disabled">28</button>
+              <button class="calendar-day" onclick="selectDay(this)">1</button>
+              <button class="calendar-day" onclick="selectDay(this)">2</button>
+              <button class="calendar-day" onclick="selectDay(this)">3</button>
+              <button class="calendar-day" onclick="selectDay(this)">4</button>
+              <button class="calendar-day" onclick="selectDay(this)">5</button>
+              <button class="calendar-day" onclick="selectDay(this)">6</button>
+              <button class="calendar-day disabled">7</button>
+              <button class="calendar-day" onclick="selectDay(this)">8</button>
+              <button class="calendar-day" onclick="selectDay(this)">9</button>
+              <button class="calendar-day" onclick="selectDay(this)">10</button>
+              <button class="calendar-day" onclick="selectDay(this)">11</button>
+              <button class="calendar-day" onclick="selectDay(this)">12</button>
+              <button class="calendar-day" onclick="selectDay(this)">13</button>
+              <button class="calendar-day disabled">14</button>
+              <button class="calendar-day" onclick="selectDay(this)">15</button>
+              <button class="calendar-day" onclick="selectDay(this)">16</button>
+              <button class="calendar-day" onclick="selectDay(this)">17</button>
+              <button class="calendar-day" onclick="selectDay(this)">18</button>
+              <button class="calendar-day" onclick="selectDay(this)">19</button>
+              <button class="calendar-day" onclick="selectDay(this)">20</button>
+              <button class="calendar-day disabled">21</button>
+              <button class="calendar-day" onclick="selectDay(this)">22</button>
+              <button class="calendar-day" onclick="selectDay(this)">23</button>
+              <button class="calendar-day" onclick="selectDay(this)">24</button>
+              <button class="calendar-day" onclick="selectDay(this)">25</button>
+              <button class="calendar-day" onclick="selectDay(this)">26</button>
+              <button class="calendar-day" onclick="selectDay(this)">27</button>
+              <button class="calendar-day disabled">28</button>
+              <button class="calendar-day today selected" onclick="selectDay(this)">29</button>
+              <button class="calendar-day" onclick="selectDay(this)">30</button>
+              <button class="calendar-day" onclick="selectDay(this)">31</button>
+            </div>
+          </div>
+
+          <div class="booking-step-label" style="margin-top:24px;">שעות פנויות</div>
+          <div class="time-slots-grid">
+            <button class="time-slot" onclick="selectTimeSlot(this)">09:00</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">09:30</button>
+            <button class="time-slot unavailable">10:00</button>
+            <button class="time-slot unavailable">10:30</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">11:00</button>
+            <button class="time-slot unavailable">11:30</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">12:00</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">12:30</button>
+            <button class="time-slot unavailable">13:00</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">14:00</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">14:30</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">15:00</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">15:30</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">16:00</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">16:30</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">17:00</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">17:30</button>
+            <button class="time-slot" onclick="selectTimeSlot(this)">18:00</button>
+          </div>
+
+          <div class="booking-actions">
+            <button class="btn btn-secondary" onclick="goToBookingStep(1)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><polyline points="9 18 15 12 9 6"/></svg>
+              חזרה
+            </button>
+            <button class="btn btn-primary" onclick="goToBookingStep(3)">
+              המשך
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><polyline points="15 18 9 12 15 6"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Booking Step 3: Customer Details -->
+        <div class="booking-step" data-booking-step="3">
+          <div class="booking-step-label">שלב 3 מתוך 4 — הפרטים שלך</div>
+
+          <div class="booking-form-group">
+            <label>שם מלא</label>
+            <input type="text" placeholder="הזן את שמך המלא">
+          </div>
+          <div class="booking-form-group">
+            <label>טלפון</label>
+            <input type="tel" placeholder="050-1234567" dir="ltr" style="text-align:left;font-family:'Inter',sans-serif;">
+          </div>
+          <div class="booking-form-group">
+            <label>הערות (אופציונלי)</label>
+            <textarea placeholder="משהו שחשוב לך שנדע?"></textarea>
+          </div>
+
+          <div class="booking-actions">
+            <button class="btn btn-secondary" onclick="goToBookingStep(2)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><polyline points="9 18 15 12 9 6"/></svg>
+              חזרה
+            </button>
+            <button class="btn btn-primary" onclick="goToBookingStep(4)">
+              קבע תור
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><polyline points="20 6 9 17 4 12"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Booking Step 4: Summary -->
+        <div class="booking-step" data-booking-step="4">
+          <div style="text-align:center;padding:20px 0;">
+            <div class="success-checkmark">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"/>
+              </svg>
+            </div>
+            <h3 style="font-size:1.3rem;font-weight:700;margin-bottom:8px;">התור נקבע בהצלחה!</h3>
+            <p style="color:var(--text-secondary);font-size:0.9rem;margin-bottom:24px;">תזכורת תשלח אליך ביום התור</p>
+            <div class="confirmation-details" style="text-align:right;">
+              <div class="confirmation-detail-row">
+                <span class="confirmation-detail-label">שירות</span>
+                <span class="confirmation-detail-value">תספורת גברים</span>
+              </div>
+              <div class="confirmation-detail-row">
+                <span class="confirmation-detail-label">תאריך</span>
+                <span class="confirmation-detail-value">29 במרץ 2026</span>
+              </div>
+              <div class="confirmation-detail-row">
+                <span class="confirmation-detail-label">שעה</span>
+                <span class="confirmation-detail-value" style="direction:ltr;">14:00</span>
+              </div>
+              <div class="confirmation-detail-row">
+                <span class="confirmation-detail-label">מחיר</span>
+                <span class="confirmation-detail-value" style="direction:ltr;">₪60</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================
+     SCREEN 5: CONFIRMATION (Standalone)
+     ============================================ -->
+<section id="confirmation">
+  <div class="confirmation-container">
+    <div style="margin-bottom:32px;">
+      <span class="section-label fade-in">אישור</span>
+    </div>
+    <div class="confirmation-card fade-in">
+      <div class="success-checkmark">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12"/>
+        </svg>
+      </div>
+      <h2 class="confirmation-title">התור נקבע!</h2>
+      <p class="confirmation-subtitle">
+        קיבלת אישור ב-SMS. נתראה!
+      </p>
+      <div class="confirmation-details">
+        <div class="confirmation-detail-row">
+          <span class="confirmation-detail-label">עסק</span>
+          <span class="confirmation-detail-value">הסטודיו של דנה</span>
+        </div>
+        <div class="confirmation-detail-row">
+          <span class="confirmation-detail-label">שירות</span>
+          <span class="confirmation-detail-value">תספורת גברים</span>
+        </div>
+        <div class="confirmation-detail-row">
+          <span class="confirmation-detail-label">תאריך</span>
+          <span class="confirmation-detail-value">יום ראשון, 29 במרץ</span>
+        </div>
+        <div class="confirmation-detail-row">
+          <span class="confirmation-detail-label">שעה</span>
+          <span class="confirmation-detail-value" style="direction:ltr;">14:00</span>
+        </div>
+        <div class="confirmation-detail-row">
+          <span class="confirmation-detail-label">מחיר</span>
+          <span class="confirmation-detail-value" style="direction:ltr;">₪60</span>
+        </div>
+      </div>
+      <div class="confirmation-actions">
+        <button class="btn btn-primary" style="width:100%;justify-content:center;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+            <line x1="16" y1="2" x2="16" y2="6"/>
+            <line x1="8" y1="2" x2="8" y2="6"/>
+            <line x1="3" y1="10" x2="21" y2="10"/>
+          </svg>
+          הוסף ליומן
+        </button>
+        <button class="btn btn-outline" style="width:100%;justify-content:center;">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="18" cy="5" r="3"/>
+            <circle cx="6" cy="12" r="3"/>
+            <circle cx="18" cy="19" r="3"/>
+            <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+            <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+          </svg>
+          שתף עם חברים
+        </button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================
+     FOOTER
+     ============================================ -->
+<footer class="proto-footer">
+  <p>PickTime Prototype — עוצב ופותח עבור <a href="#">Itzhak Tzadaka</a></p>
+  <p style="margin-top:8px;opacity:0.6;">זהו פרוטוטייפ עיצובי בלבד · גרסה 1.0</p>
+</footer>
+
+<!-- ============================================
+     JAVASCRIPT
+     ============================================ -->
+<script>
+// ============================================
+// Scroll reveal (fade-in on scroll)
+// ============================================
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+    }
+  });
+}, { threshold: 0.1, rootMargin: '0px 0px -50px 0px' });
+
+document.querySelectorAll('.fade-in').forEach(el => observer.observe(el));
+
+// ============================================
+// Navigation active state
+// ============================================
+const navLinks = document.querySelectorAll('.nav-links a');
+const sections = document.querySelectorAll('section[id]');
+
+window.addEventListener('scroll', () => {
+  let current = '';
+  sections.forEach(section => {
+    const sectionTop = section.offsetTop - 200;
+    if (window.scrollY >= sectionTop) {
+      current = section.getAttribute('id');
+    }
+  });
+  navLinks.forEach(link => {
+    link.classList.remove('active');
+    if (link.getAttribute('href') === '#' + current) {
+      link.classList.add('active');
+    }
+  });
+});
+
+// ============================================
+// Onboarding Wizard
+// ============================================
+let currentStep = 1;
+
+function goToStep(step) {
+  currentStep = step;
+
+  // Update steps visibility
+  document.querySelectorAll('.wizard-step').forEach(s => s.classList.remove('active'));
+  document.querySelector(`.wizard-step[data-step="${step}"]`).classList.add('active');
+
+  // Update progress dots
+  document.querySelectorAll('.progress-dot').forEach(dot => {
+    const dotStep = parseInt(dot.dataset.step);
+    dot.classList.remove('active', 'completed');
+    if (dotStep === step) dot.classList.add('active');
+    else if (dotStep < step) {
+      dot.classList.add('completed');
+      dot.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+    } else {
+      dot.textContent = dotStep;
+    }
+  });
+
+  // Update progress lines
+  document.querySelectorAll('.progress-line-fill').forEach((line, i) => {
+    line.classList.toggle('filled', i < step - 1);
+  });
+}
+
+// ============================================
+// Username availability check (simulated)
+// ============================================
+let usernameTimeout;
+function checkUsername(input) {
+  const hint = document.getElementById('usernameHint');
+  const val = input.value.toLowerCase().replace(/[^a-z0-9-]/g, '');
+  input.value = val;
+
+  clearTimeout(usernameTimeout);
+
+  if (!val) {
+    hint.textContent = 'picktime.co.il/your-name';
+    hint.className = 'input-hint';
+    return;
+  }
+
+  hint.textContent = 'בודק זמינות...';
+  hint.className = 'input-hint';
+
+  usernameTimeout = setTimeout(() => {
+    if (val.length < 3) {
+      hint.textContent = 'מינימום 3 תווים';
+      hint.className = 'input-hint error';
+    } else if (['admin', 'test', 'picktime'].includes(val)) {
+      hint.textContent = `picktime.co.il/${val} — תפוס 😕`;
+      hint.className = 'input-hint error';
+    } else {
+      hint.textContent = `picktime.co.il/${val} — פנוי! ✓`;
+      hint.className = 'input-hint success';
+    }
+  }, 500);
+}
+
+// ============================================
+// Business type selection
+// ============================================
+function selectType(card) {
+  document.querySelectorAll('.type-card').forEach(c => c.classList.remove('selected'));
+  card.classList.add('selected');
+}
+
+// ============================================
+// Add service
+// ============================================
+function addService() {
+  const names = ['עיצוב גבות', 'פדיקור', 'מניקור', 'עיסוי', 'טיפול פנים', 'החלקה'];
+  const prices = [50, 80, 70, 150, 120, 200];
+  const durations = [20, 45, 30, 60, 45, 90];
+  const idx = Math.floor(Math.random() * names.length);
+
+  const item = document.createElement('div');
+  item.className = 'service-item';
+  item.innerHTML = `
+    <div style="flex:1">
+      <div class="service-name">${names[idx]}</div>
+      <div class="service-duration">${durations[idx]} דקות</div>
+    </div>
+    <div class="service-price">₪${prices[idx]}</div>
+    <button class="remove-btn" onclick="this.closest('.service-item').remove()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+      </svg>
+    </button>
+  `;
+  document.getElementById('servicesList').appendChild(item);
+}
+
+// ============================================
+// Theme selection
+// ============================================
+function selectTheme(option) {
+  document.querySelectorAll('.theme-option').forEach(o => o.classList.remove('selected'));
+  option.classList.add('selected');
+}
+
+// ============================================
+// Booking flow
+// ============================================
+function goToBookingStep(step) {
+  document.querySelectorAll('.booking-step').forEach(s => s.classList.remove('active'));
+  document.querySelector(`.booking-step[data-booking-step="${step}"]`).classList.add('active');
+}
+
+function selectBookingService(card) {
+  document.querySelectorAll('.service-select-card').forEach(c => c.classList.remove('selected'));
+  card.classList.add('selected');
+}
+
+function selectDay(btn) {
+  if (btn.classList.contains('disabled')) return;
+  document.querySelectorAll('.calendar-day').forEach(d => d.classList.remove('selected'));
+  btn.classList.add('selected');
+}
+
+function selectTimeSlot(btn) {
+  if (btn.classList.contains('unavailable')) return;
+  document.querySelectorAll('.time-slot').forEach(t => t.classList.remove('selected'));
+  btn.classList.add('selected');
+}
+
+// ============================================
+// Smooth scroll for nav links
+// ============================================
+document.querySelectorAll('a[href^="#"]').forEach(link => {
+  link.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.querySelector(link.getAttribute('href'));
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  });
+});
+</script>
+
+</body>
+</html>
