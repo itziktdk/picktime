@@ -5,14 +5,120 @@ const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
+const crypto = require('crypto');
+
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'snaptor-secret-key-change-in-production';
 
 const app = express();
 
-// Middleware
+// ============ SECURITY HELPERS ============
+
+// XSS sanitization
+function sanitize(str) {
+  if (typeof str !== 'string') return str;
+  return str.replace(/<[^>]*>/g, '').replace(/[<>"'&]/g, (c) => {
+    return { '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '&': '&amp;' }[c];
+  }).trim();
+}
+
+function sanitizeObject(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(v => typeof v === 'string' ? sanitize(v) : typeof v === 'object' ? sanitizeObject(v) : v);
+  const clean = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (typeof val === 'string') clean[key] = sanitize(val);
+    else if (typeof val === 'object' && val !== null) clean[key] = sanitizeObject(val);
+    else clean[key] = val;
+  }
+  return clean;
+}
+
+// NoSQL injection prevention
+function sanitizeQuery(str) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[${}]/g, '');
+}
+
+// Israeli phone validation
+function isValidIsraeliPhone(phone) {
+  if (typeof phone !== 'string') return false;
+  const cleaned = phone.replace(/[\s\-()]/g, '');
+  return /^(\+972|972|0)(5[0-9]|7[0-9])\d{7}$/.test(cleaned);
+}
+
+// Booking tokens (anti-spam)
+const bookingTokens = new Map();
+
+function cleanExpiredTokens() {
+  const now = Date.now();
+  for (const [k, v] of bookingTokens) {
+    if (now - v.createdAt > 600000) bookingTokens.delete(k);
+  }
+}
+
+// Auth middleware
+function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.businessId = decoded.businessId;
+    req.businessSlug = decoded.slug;
+    next();
+  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+}
+
+// Ownership verification: ensure authenticated user owns the business slug
+async function verifyOwnership(req, res, next) {
+  const business = await getBusinessBySlug(req.params.slug);
+  if (!business) return res.status(404).json({ error: 'Business not found' });
+  if (business._id.toString() !== req.businessId) {
+    return res.status(403).json({ error: 'Not authorized for this business' });
+  }
+  req.business = business;
+  next();
+}
+
+// Sanitize all POST/PUT bodies
+function sanitizeBody(req, res, next) {
+  if (req.body && typeof req.body === 'object') {
+    req.body = sanitizeObject(req.body);
+  }
+  next();
+}
+
+// ============ RATE LIMITERS ============
+
+const globalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
+
+const bookingLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  message: { error: 'Too many bookings. Try again later.' },
+  keyGenerator: (req) => req.ip
+});
+
+const createBusinessLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: 3,
+  message: { error: 'Too many businesses created. Try again tomorrow.' },
+  keyGenerator: (req) => req.ip
+});
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many login attempts. Try again later.' }
+});
+
+// ============ MIDDLEWARE ============
+
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
+app.use(globalLimiter);
+app.use(sanitizeBody);
 app.use(express.static('public'));
 
 // MongoDB connection
@@ -22,7 +128,6 @@ const client = new MongoClient(process.env.MONGODB_URI);
 async function connectDB() {
   await client.connect();
   db = client.db('picktime');
-  // Create indexes
   await db.collection('businesses').createIndex({ slug: 1 }, { unique: true });
   await db.collection('appointments').createIndex({ businessId: 1, date: 1 });
   await db.collection('customers').createIndex({ businessId: 1, phone: 1 });
@@ -33,18 +138,60 @@ async function connectDB() {
 
 // Helper: get business by slug
 async function getBusinessBySlug(slug) {
-  return db.collection('businesses').findOne({ slug });
+  return db.collection('businesses').findOne({ slug: sanitizeQuery(slug) });
 }
+
+// ============ AUTH ============
+
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone is required' });
+    const business = await db.collection('businesses').findOne({ phone: sanitizeQuery(phone) });
+    if (!business) return res.json({ exists: false });
+    const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ exists: true, token, business });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get current user's full business data (authenticated)
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const business = await db.collection('businesses').findOne({ _id: new ObjectId(req.businessId) });
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    res.json(business);
+  } catch (err) {
+    console.error('Auth me error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============ BOOKING TOKEN ============
+
+app.get('/api/businesses/:slug/booking-token', async (req, res) => {
+  try {
+    const token = crypto.randomBytes(16).toString('hex');
+    bookingTokens.set(token, { slug: req.params.slug, createdAt: Date.now(), used: false });
+    cleanExpiredTokens();
+    res.json({ token });
+  } catch (err) {
+    console.error('Booking token error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // ============ BUSINESSES ============
 
-// Create business
-app.post('/api/businesses', async (req, res) => {
+// Create business (rate limited)
+app.post('/api/businesses', createBusinessLimiter, async (req, res) => {
   try {
     const { name, slug, type, phone, email, theme, workingHours, services } = req.body;
     if (!name || !slug) return res.status(400).json({ error: 'Name and slug are required' });
 
-    const existing = await db.collection('businesses').findOne({ slug });
+    const existing = await db.collection('businesses').findOne({ slug: slug.toLowerCase() });
     if (existing) return res.status(409).json({ error: 'Slug already taken' });
 
     const business = {
@@ -71,29 +218,41 @@ app.post('/api/businesses', async (req, res) => {
 
     const result = await db.collection('businesses').insertOne(business);
     business._id = result.insertedId;
-    res.status(201).json(business);
+    const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
+    res.status(201).json({ ...business, token });
   } catch (err) {
     console.error('Create business error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Get business by slug
+// Get business by slug — PUBLIC (limited fields only)
 app.get('/api/businesses/:slug', async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    res.json(business);
+    // Return only public fields — NO phone, email, _id, createdAt
+    const { name, slug, type, theme, services, workingHours, customization } = business;
+    res.json({
+      name, slug, type, theme,
+      services: (services || []).map(s => ({ name: s.name, duration: s.duration, price: s.price, _id: s._id })),
+      workingHours,
+      customization
+    });
   } catch (err) {
     console.error('Get business error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Update business
-app.put('/api/businesses/:id', async (req, res) => {
+// Update business by slug — PROTECTED
+app.put('/api/businesses/:slug', authMiddleware, async (req, res) => {
   try {
-    const { name, type, phone, email, theme, customization, workingHours } = req.body;
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
+    const { name, type, phone, email, theme, customization, workingHours, services } = req.body;
     const update = {};
     if (name !== undefined) update.name = name;
     if (type !== undefined) update.type = type;
@@ -102,24 +261,25 @@ app.put('/api/businesses/:id', async (req, res) => {
     if (theme !== undefined) update.theme = theme;
     if (customization !== undefined) update.customization = customization;
     if (workingHours !== undefined) update.workingHours = workingHours;
+    if (services !== undefined) update.services = services.map(s => ({ ...s, _id: s._id ? new ObjectId(s._id) : new ObjectId() }));
 
     const result = await db.collection('businesses').findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      { slug: req.params.slug },
       { $set: update },
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Business not found' });
     res.json(result);
   } catch (err) {
-    console.error('Update business error:', err);
+    console.error('Update business by slug error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Check username availability
+// Check username availability — PUBLIC
 app.get('/api/check-username/:username', async (req, res) => {
   try {
-    const existing = await db.collection('businesses').findOne({ slug: req.params.username.toLowerCase() });
+    const existing = await db.collection('businesses').findOne({ slug: sanitizeQuery(req.params.username.toLowerCase()) });
     res.json({ available: !existing, username: req.params.username.toLowerCase() });
   } catch (err) {
     console.error('Check username error:', err);
@@ -127,33 +287,28 @@ app.get('/api/check-username/:username', async (req, res) => {
   }
 });
 
-// ============ SERVICES ============
+// ============ SERVICES (PROTECTED) ============
 
-// List services
 app.get('/api/businesses/:slug/services', async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    res.json(business.services || []);
+    res.json((business.services || []).map(s => ({ name: s.name, duration: s.duration, price: s.price, _id: s._id })));
   } catch (err) {
     console.error('List services error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Add service
-app.post('/api/businesses/:slug/services', async (req, res) => {
+app.post('/api/businesses/:slug/services', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const { name, duration, price, currency } = req.body;
     if (!name || !duration) return res.status(400).json({ error: 'Name and duration are required' });
 
-    const service = {
-      _id: new ObjectId(),
-      name,
-      duration: Number(duration),
-      price: Number(price) || 0,
-      currency: currency || 'ILS'
-    };
+    const service = { _id: new ObjectId(), name, duration: Number(duration), price: Number(price) || 0, currency: currency || 'ILS' };
 
     const result = await db.collection('businesses').findOneAndUpdate(
       { slug: req.params.slug },
@@ -168,9 +323,11 @@ app.post('/api/businesses/:slug/services', async (req, res) => {
   }
 });
 
-// Update service
-app.put('/api/businesses/:slug/services/:id', async (req, res) => {
+app.put('/api/businesses/:slug/services/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const { name, duration, price, currency } = req.body;
     const update = {};
     if (name !== undefined) update['services.$.name'] = name;
@@ -192,9 +349,11 @@ app.put('/api/businesses/:slug/services/:id', async (req, res) => {
   }
 });
 
-// Delete service
-app.delete('/api/businesses/:slug/services/:id', async (req, res) => {
+app.delete('/api/businesses/:slug/services/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const result = await db.collection('businesses').findOneAndUpdate(
       { slug: req.params.slug },
       { $pull: { services: { _id: new ObjectId(req.params.id) } } },
@@ -210,25 +369,23 @@ app.delete('/api/businesses/:slug/services/:id', async (req, res) => {
 
 // ============ APPOINTMENTS ============
 
-// List appointments (with date range filter)
-app.get('/api/businesses/:slug/appointments', async (req, res) => {
+// List appointments — PROTECTED (only owner)
+app.get('/api/businesses/:slug/appointments', authMiddleware, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
     const query = { businessId: business._id };
     if (req.query.date) {
-      query.date = req.query.date;
+      query.date = sanitizeQuery(req.query.date);
     } else {
-      if (req.query.from) query.date = { $gte: req.query.from };
-      if (req.query.to) query.date = { ...(query.date || {}), $lte: req.query.to };
+      if (req.query.from) query.date = { $gte: sanitizeQuery(req.query.from) };
+      if (req.query.to) query.date = { ...(query.date || {}), $lte: sanitizeQuery(req.query.to) };
     }
-    if (req.query.status) query.status = req.query.status;
+    if (req.query.status) query.status = sanitizeQuery(req.query.status);
 
-    const appointments = await db.collection('appointments')
-      .find(query)
-      .toArray();
-    // Sort in JS (CosmosDB doesn't support multi-field sort without composite index)
+    const appointments = await db.collection('appointments').find(query).toArray();
     appointments.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
     res.json(appointments);
   } catch (err) {
@@ -237,26 +394,45 @@ app.get('/api/businesses/:slug/appointments', async (req, res) => {
   }
 });
 
-// Book appointment
-app.post('/api/businesses/:slug/appointments', async (req, res) => {
+// Book appointment — PUBLIC (with booking token + rate limit)
+app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
 
-    const { serviceId, customerName, customerPhone, customerEmail, date, startTime, notes } = req.body;
+    // Check if request is from authenticated business owner
+    const { bookingToken, serviceId, customerName, customerPhone, customerEmail, date, startTime, notes } = req.body;
+    const authHeader = req.headers.authorization;
+    let isOwner = false;
+    if (authHeader) {
+      try {
+        const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
+        if (decoded.slug === req.params.slug) isOwner = true;
+      } catch {}
+    }
+
+    // Verify booking token only for public (non-owner) bookings
+    if (!isOwner) {
+      const bt = bookingTokens.get(bookingToken);
+      if (!bt || bt.used || bt.slug !== req.params.slug || Date.now() - bt.createdAt > 600000) {
+        return res.status(403).json({ error: 'Invalid or expired booking token' });
+      }
+      bt.used = true;
+    }
+
     if (!customerName || !customerPhone || !date || !startTime || !serviceId) {
       return res.status(400).json({ error: 'Missing required fields: customerName, customerPhone, date, startTime, serviceId' });
     }
 
-    // Find service to get duration - support both _id match and numeric index
+    // Validate Israeli phone
+    if (!isValidIsraeliPhone(customerPhone)) {
+      return res.status(400).json({ error: 'Invalid phone number format' });
+    }
+
+    // Find service
     let service = business.services.find(s => s._id && s._id.toString() === serviceId);
-    if (!service && !isNaN(serviceId)) {
-      service = business.services[parseInt(serviceId)];
-    }
-    if (!service && business.services.length > 0) {
-      // Try matching by name as fallback
-      service = business.services.find(s => s.name === serviceId);
-    }
+    if (!service && !isNaN(serviceId)) service = business.services[parseInt(serviceId)];
+    if (!service && business.services.length > 0) service = business.services.find(s => s.name === serviceId);
     if (!service) return res.status(400).json({ error: 'Service not found' });
 
     // Calculate end time
@@ -322,13 +498,16 @@ app.post('/api/businesses/:slug/appointments', async (req, res) => {
     res.status(201).json(appointment);
   } catch (err) {
     console.error('Book appointment error:', err.message);
-    res.status(500).json({ error: 'Internal server error', detail: err.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Update appointment status (confirm/decline/cancel with notes)
-app.put('/api/businesses/:slug/appointments/:id', async (req, res) => {
+// Update appointment — PROTECTED
+app.put('/api/businesses/:slug/appointments/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const { status, notes, confirmationNote, cancellationReason } = req.body;
     const update = {};
     if (status) update.status = status;
@@ -349,9 +528,12 @@ app.put('/api/businesses/:slug/appointments/:id', async (req, res) => {
   }
 });
 
-// Cancel appointment
-app.delete('/api/businesses/:slug/appointments/:id', async (req, res) => {
+// Cancel appointment — PROTECTED
+app.delete('/api/businesses/:slug/appointments/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const { cancellationReason } = req.body || {};
     const update = { status: 'cancelled' };
     if (cancellationReason) update.cancellationReason = cancellationReason;
@@ -369,11 +551,13 @@ app.delete('/api/businesses/:slug/appointments/:id', async (req, res) => {
   }
 });
 
-// ============ RESCHEDULE ============
+// ============ RESCHEDULE (PROTECTED) ============
 
-// Request reschedule
-app.post('/api/businesses/:slug/appointments/:id/reschedule', async (req, res) => {
+app.post('/api/businesses/:slug/appointments/:id/reschedule', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const { requestedDate, requestedTime, reason } = req.body;
     if (!requestedDate || !requestedTime) {
       return res.status(400).json({ error: 'requestedDate and requestedTime are required' });
@@ -390,9 +574,7 @@ app.post('/api/businesses/:slug/appointments/:id/reschedule', async (req, res) =
 
     const result = await db.collection('appointments').findOneAndUpdate(
       { _id: new ObjectId(req.params.id) },
-      { 
-        $set: { status: 'reschedule_requested', rescheduleRequest }
-      },
+      { $set: { status: 'reschedule_requested', rescheduleRequest } },
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Appointment not found' });
@@ -403,10 +585,12 @@ app.post('/api/businesses/:slug/appointments/:id/reschedule', async (req, res) =
   }
 });
 
-// Accept/decline reschedule
-app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', async (req, res) => {
+app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', authMiddleware, async (req, res) => {
   try {
-    const { action } = req.body; // 'accept' or 'decline'
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
+    const { action } = req.body;
     if (!['accept', 'decline'].includes(action)) {
       return res.status(400).json({ error: 'action must be accept or decline' });
     }
@@ -416,7 +600,6 @@ app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', async (r
 
     let update;
     if (action === 'accept') {
-      // Move to new date/time
       update = {
         $set: {
           date: appointment.rescheduleRequest.requestedDate,
@@ -426,12 +609,7 @@ app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', async (r
         }
       };
     } else {
-      update = {
-        $set: {
-          status: 'confirmed',
-          'rescheduleRequest.status': 'declined'
-        }
-      };
+      update = { $set: { status: 'confirmed', 'rescheduleRequest.status': 'declined' } };
     }
 
     const result = await db.collection('appointments').findOneAndUpdate(
@@ -448,7 +626,7 @@ app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', async (r
 
 // ============ ANNOUNCEMENTS ============
 
-// Get announcements
+// Get announcements — PUBLIC
 app.get('/api/businesses/:slug/announcements', async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
@@ -460,27 +638,21 @@ app.get('/api/businesses/:slug/announcements', async (req, res) => {
     announcements.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     res.json(announcements);
   } catch (err) {
-    console.error('Get announcements error:', err.message, err.stack);
-    res.status(500).json({ error: 'Internal server error', detail: err.message });
+    console.error('Get announcements error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Create announcement
-app.post('/api/businesses/:slug/announcements', async (req, res) => {
+// Create announcement — PROTECTED
+app.post('/api/businesses/:slug/announcements', authMiddleware, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
     const { message } = req.body;
     if (!message) return res.status(400).json({ error: 'Message is required' });
 
-    const announcement = {
-      businessId: business._id,
-      message,
-      isActive: true,
-      createdAt: new Date()
-    };
-
+    const announcement = { businessId: business._id, message, isActive: true, createdAt: new Date() };
     const result = await db.collection('announcements').insertOne(announcement);
     announcement._id = result.insertedId;
     res.status(201).json(announcement);
@@ -490,9 +662,12 @@ app.post('/api/businesses/:slug/announcements', async (req, res) => {
   }
 });
 
-// Delete announcement
-app.delete('/api/businesses/:slug/announcements/:id', async (req, res) => {
+// Delete announcement — PROTECTED
+app.delete('/api/businesses/:slug/announcements/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const result = await db.collection('announcements').findOneAndUpdate(
       { _id: new ObjectId(req.params.id) },
       { $set: { isActive: false } },
@@ -506,27 +681,23 @@ app.delete('/api/businesses/:slug/announcements/:id', async (req, res) => {
   }
 });
 
-// ============ CUSTOMERS ============
+// ============ CUSTOMERS (ALL PROTECTED) ============
 
-// List customers
-app.get('/api/businesses/:slug/customers', async (req, res) => {
+app.get('/api/businesses/:slug/customers', authMiddleware, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
     const query = { businessId: business._id.toString() };
     const { filter, search } = req.query;
 
     const now = new Date();
     if (filter === 'recent') {
-      const thirtyDaysAgo = new Date(now - 30 * 86400000);
-      query.lastVisit = { $gte: thirtyDaysAgo };
+      query.lastVisit = { $gte: new Date(now - 30 * 86400000) };
     } else if (filter === 'new') {
-      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-      query.createdAt = { $gte: monthStart };
+      query.createdAt = { $gte: new Date(now.getFullYear(), now.getMonth(), 1) };
     } else if (filter === 'inactive') {
-      const threeMonthsAgo = new Date(now - 90 * 86400000);
-      query.$or = [{ lastVisit: { $lt: threeMonthsAgo } }, { lastVisit: null }];
+      query.$or = [{ lastVisit: { $lt: new Date(now - 90 * 86400000) } }, { lastVisit: null }];
     } else if (filter === 'vip') {
       query.isVip = true;
     } else if (filter === 'birthdays') {
@@ -535,13 +706,12 @@ app.get('/api/businesses/:slug/customers', async (req, res) => {
     }
 
     if (search) {
-      const regex = new RegExp(search, 'i');
+      const sanitizedSearch = sanitizeQuery(search);
+      const regex = new RegExp(sanitizedSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
       query.$or = [{ name: regex }, { phone: regex }];
     }
 
-    const customers = await db.collection('customers')
-      .find(query)
-      .toArray();
+    const customers = await db.collection('customers').find(query).toArray();
     customers.sort((a, b) => new Date(b.lastVisit || 0) - new Date(a.lastVisit || 0));
     res.json(customers);
   } catch (err) {
@@ -550,11 +720,10 @@ app.get('/api/businesses/:slug/customers', async (req, res) => {
   }
 });
 
-// Customer groups with counts
-app.get('/api/businesses/:slug/customers/groups', async (req, res) => {
+app.get('/api/businesses/:slug/customers/groups', authMiddleware, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
     const bid = business._id.toString();
     const now = new Date();
@@ -572,7 +741,6 @@ app.get('/api/businesses/:slug/customers/groups', async (req, res) => {
       db.collection('customers').countDocuments({ businessId: bid, birthday: mmdd }),
     ]);
 
-    // Count recent cancellations
     const cancelled = await db.collection('appointments').countDocuments({
       businessId: business._id, status: 'cancelled',
       date: { $gte: new Date(now - 30 * 86400000).toISOString().split('T')[0] }
@@ -592,28 +760,19 @@ app.get('/api/businesses/:slug/customers/groups', async (req, res) => {
   }
 });
 
-// Create customer
-app.post('/api/businesses/:slug/customers', async (req, res) => {
+app.post('/api/businesses/:slug/customers', authMiddleware, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
     const { name, phone, email, notes, birthday } = req.body;
     if (!name || !phone) return res.status(400).json({ error: 'Name and phone are required' });
 
     const customer = {
       businessId: business._id.toString(),
-      name,
-      phone,
-      email: email || '',
-      notes: notes || '',
-      isVip: false,
-      tags: [],
-      totalVisits: 0,
-      totalSpent: 0,
-      lastVisit: null,
-      birthday: birthday || '',
-      createdAt: new Date(),
+      name, phone, email: email || '', notes: notes || '',
+      isVip: false, tags: [], totalVisits: 0, totalSpent: 0,
+      lastVisit: null, birthday: birthday || '', createdAt: new Date(),
     };
 
     const result = await db.collection('customers').insertOne(customer);
@@ -625,30 +784,31 @@ app.post('/api/businesses/:slug/customers', async (req, res) => {
   }
 });
 
-// Get customer with visit history
-app.get('/api/businesses/:slug/customers/:id', async (req, res) => {
+app.get('/api/businesses/:slug/customers/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const customer = await db.collection('customers').findOne({ _id: new ObjectId(req.params.id) });
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
-    // Get visit history (past appointments for this customer phone)
-    const business = await getBusinessBySlug(req.params.slug);
     const visits = await db.collection('appointments')
       .find({ businessId: business._id, customerPhone: customer.phone, status: { $in: ['confirmed', 'completed'] } })
       .toArray();
     visits.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-    const limitedVisits = visits.slice(0, 50);
 
-    res.json({ ...customer, visits: limitedVisits });
+    res.json({ ...customer, visits: visits.slice(0, 50) });
   } catch (err) {
     console.error('Get customer error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Update customer
-app.put('/api/businesses/:slug/customers/:id', async (req, res) => {
+app.put('/api/businesses/:slug/customers/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const { name, phone, email, notes, isVip, tags, birthday } = req.body;
     const update = {};
     if (name !== undefined) update.name = name;
@@ -672,45 +832,38 @@ app.put('/api/businesses/:slug/customers/:id', async (req, res) => {
   }
 });
 
-// ============ TASKS ============
+// ============ TASKS (ALL PROTECTED) ============
 
-// List tasks
-app.get('/api/businesses/:slug/tasks', async (req, res) => {
+app.get('/api/businesses/:slug/tasks', authMiddleware, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
     const query = { businessId: business._id.toString() };
     if (req.query.filter === 'active') query.completed = false;
     else if (req.query.filter === 'completed') query.completed = true;
 
-    const tasks = await db.collection('tasks')
-      .find(query)
-      .toArray();
+    const tasks = await db.collection('tasks').find(query).toArray();
     tasks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
     res.json(tasks);
   } catch (err) {
-    console.error('List tasks error:', err.message, err.stack);
-    res.status(500).json({ error: 'Internal server error', detail: err.message });
+    console.error('List tasks error:', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Create task
-app.post('/api/businesses/:slug/tasks', async (req, res) => {
+app.post('/api/businesses/:slug/tasks', authMiddleware, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
     const { text, dueDate } = req.body;
     if (!text) return res.status(400).json({ error: 'Text is required' });
 
     const task = {
       businessId: business._id.toString(),
-      text,
-      dueDate: dueDate || null,
-      completed: false,
-      completedAt: null,
-      createdAt: new Date(),
+      text, dueDate: dueDate || null,
+      completed: false, completedAt: null, createdAt: new Date(),
     };
 
     const result = await db.collection('tasks').insertOne(task);
@@ -722,17 +875,16 @@ app.post('/api/businesses/:slug/tasks', async (req, res) => {
   }
 });
 
-// Update task
-app.put('/api/businesses/:slug/tasks/:id', async (req, res) => {
+app.put('/api/businesses/:slug/tasks/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const { text, dueDate, completed } = req.body;
     const update = {};
     if (text !== undefined) update.text = text;
     if (dueDate !== undefined) update.dueDate = dueDate;
-    if (completed !== undefined) {
-      update.completed = completed;
-      update.completedAt = completed ? new Date() : null;
-    }
+    if (completed !== undefined) { update.completed = completed; update.completedAt = completed ? new Date() : null; }
 
     const result = await db.collection('tasks').findOneAndUpdate(
       { _id: new ObjectId(req.params.id) },
@@ -747,9 +899,11 @@ app.put('/api/businesses/:slug/tasks/:id', async (req, res) => {
   }
 });
 
-// Delete task
-app.delete('/api/businesses/:slug/tasks/:id', async (req, res) => {
+app.delete('/api/businesses/:slug/tasks/:id', authMiddleware, async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
     const result = await db.collection('tasks').deleteOne({ _id: new ObjectId(req.params.id) });
     if (result.deletedCount === 0) return res.status(404).json({ error: 'Task not found' });
     res.json({ success: true });
@@ -759,30 +913,28 @@ app.delete('/api/businesses/:slug/tasks/:id', async (req, res) => {
   }
 });
 
-// ============ AVAILABILITY ============
+// ============ AVAILABILITY (PUBLIC) ============
 
 app.get('/api/businesses/:slug/availability', async (req, res) => {
   try {
     const { date } = req.query;
     if (!date) return res.status(400).json({ error: 'Date parameter required (YYYY-MM-DD)' });
 
+    const sanitizedDate = sanitizeQuery(date);
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
 
-    // Get day of week
-    const dayOfWeek = new Date(date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+    const dayOfWeek = new Date(sanitizedDate + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
     const hours = business.workingHours?.[dayOfWeek];
 
     if (!hours || !hours.enabled) {
-      return res.json({ date, available: false, slots: [], message: 'Business closed on this day' });
+      return res.json({ date: sanitizedDate, available: false, slots: [], message: 'Business closed on this day' });
     }
 
-    // Get existing appointments for this date
     const appointments = await db.collection('appointments')
-      .find({ businessId: business._id, date, status: { $nin: ['cancelled'] } })
+      .find({ businessId: business._id, date: sanitizedDate, status: { $nin: ['cancelled'] } })
       .toArray();
 
-    // Generate 30-minute slots
     const [startH, startM] = hours.start.split(':').map(Number);
     const [endH, endM] = hours.end.split(':').map(Number);
     const startMinutes = startH * 60 + startM;
@@ -793,17 +945,127 @@ app.get('/api/businesses/:slug/availability', async (req, res) => {
     for (let m = startMinutes; m + slotDuration <= endMinutes; m += slotDuration) {
       const slotStart = `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
       const slotEnd = `${String(Math.floor((m + slotDuration) / 60)).padStart(2, '0')}:${String((m + slotDuration) % 60).padStart(2, '0')}`;
-
-      const isBooked = appointments.some(apt =>
-        apt.startTime < slotEnd && apt.endTime > slotStart
-      );
-
+      const isBooked = appointments.some(apt => apt.startTime < slotEnd && apt.endTime > slotStart);
       slots.push({ start: slotStart, end: slotEnd, available: !isBooked });
     }
 
-    res.json({ date, dayOfWeek, available: true, slots });
+    res.json({ date: sanitizedDate, dayOfWeek, available: true, slots });
   } catch (err) {
     console.error('Availability error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============ STATS (PROTECTED) ============
+
+app.get('/api/businesses/:slug/stats', authMiddleware, async (req, res) => {
+  try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
+    const bid = business._id.toString();
+    const now = new Date();
+    const weekAgoStr = new Date(now - 7 * 86400000).toISOString().split('T')[0];
+
+    const [weekAppts, weekCancelled, weekCustomers] = await Promise.all([
+      db.collection('appointments').countDocuments({ businessId: bid, date: { $gte: weekAgoStr } }),
+      db.collection('appointments').countDocuments({ businessId: bid, status: 'cancelled', date: { $gte: weekAgoStr } }),
+      db.collection('customers').countDocuments({ businessId: bid, createdAt: { $gte: new Date(now - 7 * 86400000) } })
+    ]);
+
+    const confirmed = await db.collection('appointments').find({
+      businessId: bid, status: 'confirmed', date: { $gte: weekAgoStr }
+    }).toArray();
+    let revenue = 0;
+    for (const appt of confirmed) {
+      const svc = business.services?.find(s => s._id?.toString() === appt.serviceId || s.name === appt.serviceName);
+      if (svc) revenue += svc.price || 0;
+    }
+
+    res.json({
+      weekAppointments: weekAppts, weekCancelled,
+      cancellationRate: weekAppts > 0 ? Math.round((weekCancelled / weekAppts) * 100) : 0,
+      weekRevenue: revenue, newCustomers: weekCustomers
+    });
+  } catch (err) {
+    console.error('Stats error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ============ REMINDERS API ============
+
+// Check for pending reminders (called by cron from Johnny's VM)
+app.post('/api/reminders/check', async (req, res) => {
+  try {
+    const REMINDER_INTERVALS = [
+      { minutes: 1440, key: '1day' },
+      { minutes: 120, key: '2hours' },
+      { minutes: 30, key: '30min' },
+    ];
+
+    const businesses = await db.collection('businesses').find({ isActive: { $ne: false } }).toArray();
+    const remindersToSend = [];
+
+    for (const biz of businesses) {
+      const settings = biz.reminderSettings || { '1day': true, '2hours': true, '30min': false };
+
+      for (const interval of REMINDER_INTERVALS) {
+        if (!settings[interval.key]) continue;
+
+        const targetTime = new Date(Date.now() + interval.minutes * 60000);
+        const targetDate = targetTime.toISOString().split('T')[0];
+        const targetHour = targetTime.toTimeString().slice(0, 5);
+
+        const appointments = await db.collection('appointments').find({
+          businessId: biz._id.toString(),
+          date: targetDate,
+          startTime: targetHour,
+          status: { $in: ['confirmed', 'pending'] },
+          [`reminders.${interval.key}`]: { $ne: true },
+        }).toArray();
+
+        for (const appt of appointments) {
+          const template = settings.template || 'שלום {customer_name}, תזכורת: יש לך תור ל{service} ב{date} בשעה {time} ב{business_name}. לאישור השב 1, לביטול השב 2.';
+          const message = template
+            .replace(/{customer_name}/g, appt.customerName || '')
+            .replace(/{service}/g, appt.serviceName || '')
+            .replace(/{date}/g, appt.date || '')
+            .replace(/{time}/g, appt.startTime || '')
+            .replace(/{business_name}/g, biz.name || '');
+
+          remindersToSend.push({
+            appointmentId: appt._id.toString(),
+            businessId: biz._id.toString(),
+            customerPhone: appt.customerPhone,
+            customerName: appt.customerName,
+            message,
+            intervalKey: interval.key,
+          });
+        }
+      }
+    }
+
+    res.json({ reminders: remindersToSend, count: remindersToSend.length });
+  } catch (err) {
+    console.error('Reminders check error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Mark reminder as sent
+app.post('/api/reminders/mark-sent', async (req, res) => {
+  try {
+    const { appointmentId, intervalKey } = req.body;
+    if (!appointmentId || !intervalKey) return res.status(400).json({ error: 'Missing appointmentId or intervalKey' });
+
+    await db.collection('appointments').updateOne(
+      { _id: new ObjectId(appointmentId) },
+      { $set: { [`reminders.${intervalKey}`]: true } }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Mark reminder error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -818,7 +1080,7 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// SPA fallback — serve index.html for non-API routes
+// SPA fallback
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api')) {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
