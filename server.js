@@ -6,7 +6,22 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const path = require('path');
 
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'snaptor-secret-key-change-in-production';
+
 const app = express();
+
+// Auth middleware
+function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.businessId = decoded.businessId;
+    req.businessSlug = decoded.slug;
+    next();
+  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+}
 
 // Middleware
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -35,6 +50,62 @@ async function connectDB() {
 async function getBusinessBySlug(slug) {
   return db.collection('businesses').findOne({ slug });
 }
+
+// ============ AUTH ============
+
+// Login by phone
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'Phone is required' });
+    const business = await db.collection('businesses').findOne({ phone });
+    if (!business) return res.json({ exists: false });
+    const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ exists: true, token, business });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get current user's business
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const business = await db.collection('businesses').findOne({ _id: new ObjectId(req.businessId) });
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    res.json(business);
+  } catch (err) {
+    console.error('Auth me error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update business by slug (protected)
+app.put('/api/businesses/:slug', async (req, res) => {
+  try {
+    const { name, type, phone, email, theme, customization, workingHours, services } = req.body;
+    const update = {};
+    if (name !== undefined) update.name = name;
+    if (type !== undefined) update.type = type;
+    if (phone !== undefined) update.phone = phone;
+    if (email !== undefined) update.email = email;
+    if (theme !== undefined) update.theme = theme;
+    if (customization !== undefined) update.customization = customization;
+    if (workingHours !== undefined) update.workingHours = workingHours;
+    if (services !== undefined) update.services = services.map(s => ({ ...s, _id: s._id ? new ObjectId(s._id) : new ObjectId() }));
+
+    const result = await db.collection('businesses').findOneAndUpdate(
+      { slug: req.params.slug },
+      { $set: update },
+      { returnDocument: 'after' }
+    );
+    if (!result) return res.status(404).json({ error: 'Business not found' });
+    res.json(result);
+  } catch (err) {
+    console.error('Update business by slug error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // ============ BUSINESSES ============
 
@@ -71,7 +142,8 @@ app.post('/api/businesses', async (req, res) => {
 
     const result = await db.collection('businesses').insertOne(business);
     business._id = result.insertedId;
-    res.status(201).json(business);
+    const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
+    res.status(201).json({ ...business, token });
   } catch (err) {
     console.error('Create business error:', err);
     res.status(500).json({ error: 'Internal server error' });
