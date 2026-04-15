@@ -145,12 +145,17 @@ async function getBusinessBySlug(slug) {
 
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
-    const { phone } = req.body;
+    const { phone, slug } = req.body;
     if (!phone) return res.status(400).json({ error: 'Phone is required' });
-    const business = await db.collection('businesses').findOne({ phone: sanitizeQuery(phone) });
-    if (!business) return res.json({ exists: false });
+    const businesses = await db.collection('businesses').find({ phone: sanitizeQuery(phone) }).toArray();
+    if (!businesses.length) return res.json({ exists: false });
+    // If slug specified, pick that business; otherwise pick first (or let client choose)
+    let business = slug ? businesses.find(b => b.slug === slug) : businesses[0];
+    if (!business) business = businesses[0];
     const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ exists: true, token, business });
+    // Return all businesses so frontend can let user pick
+    const allBusinesses = businesses.map(b => ({ _id: b._id, name: b.name, slug: b.slug, type: b.type }));
+    res.json({ exists: true, token, business, businesses: allBusinesses });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Internal server error' });
