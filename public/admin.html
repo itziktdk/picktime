@@ -93,7 +93,11 @@ tr:hover td { background: #f8faff; }
 <div id="dashboard">
   <div class="top-bar">
     <h1><span>●</span> Snaptor Admin</h1>
-    <button class="logout-btn" onclick="doLogout()">יציאה</button>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="last-update" style="font-size:12px;color:var(--text3)"></span>
+      <button class="logout-btn" onclick="showDashboard()" style="border-color:var(--accent);color:var(--accent)">רענון</button>
+      <button class="logout-btn" onclick="doLogout()">יציאה</button>
+    </div>
   </div>
   <div class="container">
     <div class="stats" id="stats">
@@ -150,6 +154,7 @@ async function showDashboard() {
     if (r.status === 401) { doLogout(); return; }
     data = await r.json();
     renderStats();
+    document.getElementById('last-update').textContent = 'עודכן: ' + new Date().toLocaleTimeString('he-IL');
     switchTab('businesses');
   } catch (e) { console.error(e); }
 }
