@@ -1293,6 +1293,11 @@ app.get('/admin', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
+// Public booking page route
+app.get('/book/:slug', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'book.html'));
+});
+
 // ============ HEALTH CHECK ============
 app.get('/api/health', async (req, res) => {
   try {

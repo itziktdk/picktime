@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snaptor - קביעת תור</title>
+<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --accent: #6366f1; --accent-light: #818cf8; --accent-dark: #4f46e5;
+  --bg: #f8fafc; --card: #ffffff; --text: #0f172a; --text2: #64748b; --text3: #94a3b8;
+  --border: #e2e8f0; --success: #10b981; --danger: #ef4444;
+  --shadow: 0 1px 3px rgba(0,0,0,0.06);
+  --shadow-lg: 0 4px 12px rgba(0,0,0,0.08);
+}
+body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; -webkit-font-smoothing: antialiased; }
+
+.container { max-width: 480px; margin: 0 auto; padding: 16px; }
+
+/* Header */
+.biz-header { text-align: center; padding: 32px 16px 24px; }
+.biz-header h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+.biz-header .type { font-size: 14px; color: var(--text2); }
+
+/* Steps */
+.steps { display: flex; gap: 4px; margin-bottom: 24px; }
+.step { flex: 1; height: 4px; border-radius: 4px; background: var(--border); transition: background 0.3s; }
+.step.done { background: var(--accent); }
+.step.active { background: var(--accent-light); }
+
+/* Cards */
+.card { background: var(--card); border-radius: 16px; padding: 20px; box-shadow: var(--shadow); margin-bottom: 16px; }
+.card h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
+.card h2 svg { width: 20px; height: 20px; color: var(--accent); }
+
+/* Service list */
+.service-item { padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; margin-bottom: 8px; cursor: pointer; transition: all 0.2s; display: flex; justify-content: space-between; align-items: center; }
+.service-item:hover { border-color: var(--accent-light); background: #f5f3ff; }
+.service-item.selected { border-color: var(--accent); background: #eef2ff; }
+.service-item .name { font-weight: 500; }
+.service-item .meta { font-size: 13px; color: var(--text2); display: flex; gap: 12px; }
+.service-item .price { font-family: 'Inter', sans-serif; font-weight: 600; color: var(--accent); }
+
+/* Date picker */
+.date-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; text-align: center; }
+.date-grid .day-label { font-size: 12px; color: var(--text3); padding: 4px; font-weight: 500; }
+.date-cell { padding: 10px 4px; border-radius: 10px; cursor: pointer; font-size: 14px; font-family: 'Inter', sans-serif; transition: all 0.2s; }
+.date-cell:hover:not(.disabled) { background: #eef2ff; }
+.date-cell.selected { background: var(--accent); color: white; font-weight: 600; }
+.date-cell.disabled { color: var(--text3); cursor: default; opacity: 0.4; }
+.date-cell.today { font-weight: 700; }
+.month-nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.month-nav button { background: none; border: 1px solid var(--border); border-radius: 10px; width: 36px; height: 36px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.month-nav .month-label { font-weight: 600; }
+
+/* Time slots */
+.time-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.time-slot { padding: 12px; text-align: center; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; font-family: 'Inter', sans-serif; font-size: 15px; font-weight: 500; transition: all 0.2s; }
+.time-slot:hover:not(.disabled) { border-color: var(--accent-light); background: #f5f3ff; }
+.time-slot.selected { background: var(--accent); color: white; border-color: var(--accent); }
+.time-slot.disabled { background: var(--bg); color: var(--text3); cursor: default; }
+
+/* Form */
+.form-group { margin-bottom: 16px; }
+.form-group label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; color: var(--text2); }
+.form-group input, .form-group textarea { width: 100%; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; font-family: 'Heebo', sans-serif; font-size: 15px; outline: none; transition: border 0.2s; }
+.form-group input:focus, .form-group textarea:focus { border-color: var(--accent); }
+.form-group textarea { resize: vertical; min-height: 60px; }
+
+/* Buttons */
+.btn { width: 100%; padding: 14px; border: none; border-radius: 14px; font-family: 'Heebo', sans-serif; font-size: 16px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+.btn-primary { background: var(--accent); color: white; }
+.btn-primary:hover { background: var(--accent-dark); }
+.btn-primary:disabled { background: var(--text3); cursor: default; }
+.btn-outline { background: none; border: 1px solid var(--border); color: var(--text2); }
+.btn-outline:hover { border-color: var(--accent); color: var(--accent); }
+
+/* Confirmation */
+.confirm-card { text-align: center; padding: 40px 20px; }
+.confirm-card .check { width: 64px; height: 64px; background: #d1fae5; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px; }
+.confirm-card .check svg { width: 32px; height: 32px; color: var(--success); }
+.confirm-card h2 { font-size: 22px; margin-bottom: 8px; }
+.confirm-card .details { text-align: right; margin-top: 24px; padding: 16px; background: var(--bg); border-radius: 12px; font-size: 14px; line-height: 2; }
+
+/* Loading */
+.spinner { width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; margin: 24px auto; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-text { text-align: center; color: var(--text2); font-size: 14px; }
+
+/* Error */
+.error-msg { background: #fef2f2; color: var(--danger); padding: 12px 16px; border-radius: 12px; font-size: 14px; margin-bottom: 16px; text-align: center; }
+
+/* 404 */
+.not-found { text-align: center; padding: 80px 20px; }
+.not-found h2 { font-size: 24px; margin-bottom: 8px; }
+.not-found p { color: var(--text2); }
+
+/* Hidden */
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <div id="loading"><div class="spinner"></div><div class="loading-text">טוען...</div></div>
+  <div id="not-found" class="not-found hidden"><h2>העסק לא נמצא</h2><p>הקישור שגוי או שהעסק כבר לא פעיל</p></div>
+  
+  <div id="app" class="hidden">
+    <div class="biz-header">
+      <h1 id="biz-name"></h1>
+      <div class="type" id="biz-type"></div>
+    </div>
+    
+    <div class="steps">
+      <div class="step done" data-step="1"></div>
+      <div class="step" data-step="2"></div>
+      <div class="step" data-step="3"></div>
+      <div class="step" data-step="4"></div>
+    </div>
+
+    <!-- Step 1: Service -->
+    <div id="step-1" class="card">
+      <h2><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9.568 3H5.25A2.25 2.25 0 003 5.25v4.318c0 .597.237 1.17.659 1.591l9.581 9.581c.699.699 1.78.872 2.607.33a18.095 18.095 0 005.223-5.223c.542-.827.369-1.908-.33-2.607L11.16 3.66A2.25 2.25 0 009.568 3z" /><path stroke-linecap="round" stroke-linejoin="round" d="M6 6h.008v.008H6V6z" /></svg>בחירת שירות</h2>
+      <div id="services-list"></div>
+    </div>
+
+    <!-- Step 2: Date -->
+    <div id="step-2" class="card hidden">
+      <h2><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75m-18 0v-7.5A2.25 2.25 0 015.25 9h13.5A2.25 2.25 0 0121 11.25v7.5" /></svg>בחירת תאריך</h2>
+      <div class="month-nav">
+        <button onclick="prevMonth()">&#8250;</button>
+        <span class="month-label" id="month-label"></span>
+        <button onclick="nextMonth()">&#8249;</button>
+      </div>
+      <div class="date-grid" id="date-grid"></div>
+    </div>
+
+    <!-- Step 3: Time -->
+    <div id="step-3" class="card hidden">
+      <h2><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>בחירת שעה</h2>
+      <div id="time-loading" class="hidden"><div class="spinner"></div></div>
+      <div class="time-grid" id="time-grid"></div>
+      <div id="no-slots" class="hidden" style="text-align:center;padding:20px;color:var(--text3)">אין תורים פנויים בתאריך זה</div>
+    </div>
+
+    <!-- Step 4: Details -->
+    <div id="step-4" class="card hidden">
+      <h2><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" /></svg>פרטים אישיים</h2>
+      <div id="booking-error" class="error-msg hidden"></div>
+      <div class="form-group"><label>שם מלא</label><input type="text" id="cust-name" placeholder="ישראל ישראלי"></div>
+      <div class="form-group"><label>טלפון</label><input type="tel" id="cust-phone" placeholder="050-1234567" style="direction:ltr;text-align:right"></div>
+      <div class="form-group"><label>הערות (לא חובה)</label><textarea id="cust-notes" placeholder="בקשות מיוחדות..."></textarea></div>
+      <button class="btn btn-primary" id="book-btn" onclick="submitBooking()">אישור וקביעת תור</button>
+    </div>
+
+    <!-- Confirmation -->
+    <div id="step-done" class="card confirm-card hidden">
+      <div class="check"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg></div>
+      <h2>התור נקבע בהצלחה!</h2>
+      <p style="color:var(--text2)">נשלח לך אישור בהמשך</p>
+      <div class="details" id="booking-summary"></div>
+      <button class="btn btn-outline" style="margin-top:16px" onclick="location.reload()">קביעת תור נוסף</button>
+    </div>
+
+    <div style="text-align:center;padding:16px;margin-top:8px">
+      <a href="https://snaptor.app" style="font-size:12px;color:var(--text3);text-decoration:none">Snaptor ⚡</a>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/api';
+const slug = location.pathname.replace(/^\/book\//, '').replace(/\/$/, '');
+let biz = null, selectedService = null, selectedDate = null, selectedTime = null;
+let currentMonth = new Date();
+let bookingToken = '';
+
+async function init() {
+  if (!slug) { show404(); return; }
+  try {
+    const r = await fetch(`${API}/businesses/${slug}`);
+    if (!r.ok) { show404(); return; }
+    biz = await r.json();
+    document.getElementById('biz-name').textContent = biz.name;
+    document.getElementById('biz-type').textContent = typeLabel(biz.type);
+    renderServices();
+    document.getElementById('loading').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+    // Pre-fetch booking token
+    const tr = await fetch(`${API}/businesses/${slug}/booking-token`);
+    const td = await tr.json();
+    bookingToken = td.token;
+  } catch (e) { show404(); }
+}
+
+function show404() {
+  document.getElementById('loading').classList.add('hidden');
+  document.getElementById('not-found').classList.remove('hidden');
+}
+
+function typeLabel(t) {
+  const m = { barber: 'מספרה', beauty: 'קוסמטיקה', tutor: 'שיעורים פרטיים', general: 'עסק' };
+  return m[t] || t || '';
+}
+
+function renderServices() {
+  const el = document.getElementById('services-list');
+  el.innerHTML = (biz.services || []).map(s => `
+    <div class="service-item" onclick="selectService('${s._id}')">
+      <div>
+        <div class="name">${esc(s.name)}</div>
+        <div class="meta"><span>${s.duration} דק׳</span></div>
+      </div>
+      <div class="price">${s.price ? '₪' + s.price : ''}</div>
+    </div>
+  `).join('');
+}
+
+function selectService(id) {
+  selectedService = (biz.services || []).find(s => s._id === id);
+  document.querySelectorAll('.service-item').forEach(el => el.classList.remove('selected'));
+  event.currentTarget.classList.add('selected');
+  goToStep(2);
+  renderCalendar();
+}
+
+function goToStep(n) {
+  for (let i = 1; i <= 4; i++) {
+    document.getElementById('step-' + i)?.classList.toggle('hidden', i > n);
+  }
+  document.querySelectorAll('.step').forEach(el => {
+    const s = parseInt(el.dataset.step);
+    el.classList.toggle('done', s < n);
+    el.classList.toggle('active', s === n);
+  });
+}
+
+function renderCalendar() {
+  const year = currentMonth.getFullYear(), month = currentMonth.getMonth();
+  document.getElementById('month-label').textContent = new Date(year, month).toLocaleDateString('he-IL', { month: 'long', year: 'numeric' });
+  
+  const days = ['א׳', 'ב׳', 'ג׳', 'ד׳', 'ה׳', 'ו׳', 'ש׳'];
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  
+  let html = days.map(d => `<div class="day-label">${d}</div>`).join('');
+  for (let i = 0; i < firstDay; i++) html += '<div></div>';
+  
+  for (let d = 1; d <= daysInMonth; d++) {
+    const date = new Date(year, month, d);
+    const dateStr = date.toISOString().split('T')[0];
+    const dayName = date.toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+    const wh = biz.workingHours?.[dayName];
+    const isPast = date < today;
+    const isClosed = !wh || !wh.enabled;
+    const isToday = date.getTime() === today.getTime();
+    const isSelected = dateStr === selectedDate;
+    const cls = ['date-cell'];
+    if (isPast || isClosed) cls.push('disabled');
+    if (isToday) cls.push('today');
+    if (isSelected) cls.push('selected');
+    html += `<div class="${cls.join(' ')}" ${!isPast && !isClosed ? `onclick="selectDate('${dateStr}')"` : ''}>${d}</div>`;
+  }
+  document.getElementById('date-grid').innerHTML = html;
+}
+
+function prevMonth() {
+  currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() - 1);
+  renderCalendar();
+}
+function nextMonth() {
+  currentMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1);
+  renderCalendar();
+}
+
+async function selectDate(dateStr) {
+  selectedDate = dateStr;
+  renderCalendar();
+  goToStep(3);
+  document.getElementById('time-loading').classList.remove('hidden');
+  document.getElementById('time-grid').innerHTML = '';
+  document.getElementById('no-slots').classList.add('hidden');
+  
+  try {
+    const r = await fetch(`${API}/businesses/${slug}/availability?date=${dateStr}&serviceId=${selectedService._id}`);
+    const data = await r.json();
+    document.getElementById('time-loading').classList.add('hidden');
+    
+    if (!data.available || !data.slots?.length) {
+      document.getElementById('no-slots').classList.remove('hidden');
+      return;
+    }
+    
+    const available = data.slots.filter(s => s.available);
+    if (!available.length) {
+      document.getElementById('no-slots').classList.remove('hidden');
+      return;
+    }
+    
+    document.getElementById('time-grid').innerHTML = available.map(s =>
+      `<div class="time-slot" onclick="selectTime('${s.start}')">${s.start}</div>`
+    ).join('');
+  } catch {
+    document.getElementById('time-loading').classList.add('hidden');
+    document.getElementById('no-slots').classList.remove('hidden');
+  }
+}
+
+function selectTime(time) {
+  selectedTime = time;
+  document.querySelectorAll('.time-slot').forEach(el => el.classList.toggle('selected', el.textContent === time));
+  goToStep(4);
+}
+
+async function submitBooking() {
+  const name = document.getElementById('cust-name').value.trim();
+  const phone = document.getElementById('cust-phone').value.trim();
+  const notes = document.getElementById('cust-notes').value.trim();
+  const errEl = document.getElementById('booking-error');
+  errEl.classList.add('hidden');
+  
+  if (!name) { showError('נא להזין שם מלא'); return; }
+  if (!phone) { showError('נא להזין מספר טלפון'); return; }
+  
+  const btn = document.getElementById('book-btn');
+  btn.disabled = true;
+  btn.textContent = 'שולח...';
+  
+  try {
+    const r = await fetch(`${API}/businesses/${slug}/appointments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        bookingToken,
+        serviceId: selectedService._id,
+        customerName: name,
+        customerPhone: phone,
+        date: selectedDate,
+        startTime: selectedTime,
+        notes
+      })
+    });
+    
+    if (!r.ok) {
+      const err = await r.json();
+      showError(err.error || 'שגיאה בקביעת התור');
+      btn.disabled = false;
+      btn.textContent = 'אישור וקביעת תור';
+      return;
+    }
+    
+    // Show confirmation
+    for (let i = 1; i <= 4; i++) document.getElementById('step-' + i)?.classList.add('hidden');
+    document.querySelectorAll('.step').forEach(el => el.classList.add('done'));
+    document.getElementById('step-done').classList.remove('hidden');
+    
+    const dateFormatted = new Date(selectedDate + 'T00:00:00').toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
+    document.getElementById('booking-summary').innerHTML = `
+      <div><strong>שירות:</strong> ${esc(selectedService.name)}</div>
+      <div><strong>תאריך:</strong> ${dateFormatted}</div>
+      <div><strong>שעה:</strong> ${selectedTime}</div>
+      <div><strong>שם:</strong> ${esc(name)}</div>
+      <div><strong>טלפון:</strong> ${esc(phone)}</div>
+    `;
+  } catch {
+    showError('שגיאה בקביעת התור. נסה שוב.');
+    btn.disabled = false;
+    btn.textContent = 'אישור וקביעת תור';
+  }
+}
+
+function showError(msg) {
+  const el = document.getElementById('booking-error');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+init();
+</script>
+</body>
+</html>
