@@ -233,11 +233,16 @@ app.get('/api/businesses/:slug', async (req, res) => {
     if (!business) return res.status(404).json({ error: 'Business not found' });
     // Return only public fields — NO phone, email, _id, createdAt
     const { name, slug, type, theme, services, workingHours, customization } = business;
+    // Include staff (public fields only)
+    const publicStaff = (business.staff || []).filter(s => s.isActive !== false).map(s => ({
+      _id: s._id, name: s.name, role: s.role, services: s.services || [], workingHours: s.workingHours || {}
+    }));
     res.json({
       name, slug, type, theme,
       services: (services || []).map(s => ({ name: s.name, duration: s.duration, price: s.price, _id: s._id })),
       workingHours,
-      customization
+      customization,
+      staff: publicStaff
     });
   } catch (err) {
     console.error('Get business error:', err);
@@ -252,7 +257,7 @@ app.put('/api/businesses/:slug', authMiddleware, async (req, res) => {
     if (!business) return res.status(404).json({ error: 'Business not found' });
     if (business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
-    const { name, type, phone, email, theme, customization, workingHours, services } = req.body;
+    const { name, type, phone, email, theme, customization, workingHours, services, staff } = req.body;
     const update = {};
     if (name !== undefined) update.name = name;
     if (type !== undefined) update.type = type;
@@ -262,6 +267,7 @@ app.put('/api/businesses/:slug', authMiddleware, async (req, res) => {
     if (customization !== undefined) update.customization = customization;
     if (workingHours !== undefined) update.workingHours = workingHours;
     if (services !== undefined) update.services = services.map(s => ({ ...s, _id: s._id ? new ObjectId(s._id) : new ObjectId() }));
+    if (staff !== undefined) update.staff = staff.map(s => ({ ...s, _id: s._id ? new ObjectId(s._id) : new ObjectId() }));
 
     const result = await db.collection('businesses').findOneAndUpdate(
       { slug: req.params.slug },
@@ -401,7 +407,7 @@ app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) 
     if (!business) return res.status(404).json({ error: 'Business not found' });
 
     // Check if request is from authenticated business owner
-    const { bookingToken, serviceId, customerName, customerPhone, customerEmail, date, startTime, notes } = req.body;
+    const { bookingToken, serviceId, staffId, customerName, customerPhone, customerEmail, date, startTime, notes } = req.body;
     const authHeader = req.headers.authorization;
     let isOwner = false;
     if (authHeader) {
@@ -435,25 +441,61 @@ app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) 
     if (!service && business.services.length > 0) service = business.services.find(s => s.name === serviceId);
     if (!service) return res.status(400).json({ error: 'Service not found' });
 
+    // Validate per-day service availability
+    const dayOfWeek = new Date(date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
+    const dayHours = business.workingHours?.[dayOfWeek];
+    if (dayHours && dayHours.serviceMode === 'custom' && Array.isArray(dayHours.enabledServices)) {
+      const svcId = (service._id || serviceId).toString();
+      if (!dayHours.enabledServices.some(id => id.toString() === svcId)) {
+        return res.status(400).json({ error: 'Service not available on this day' });
+      }
+    }
+
+    // Validate staff member if provided
+    let staffName = '';
+    let resolvedStaffId = staffId || '';
+    if (staffId && business.staff?.length > 0) {
+      const sm = business.staff.find(s => s._id?.toString() === staffId);
+      if (!sm) return res.status(400).json({ error: 'Staff member not found' });
+      if (sm.isActive === false) return res.status(400).json({ error: 'Staff member is inactive' });
+      staffName = sm.name || '';
+      const staffHours = sm.workingHours?.[dayOfWeek];
+      if (staffHours && !staffHours.enabled) {
+        return res.status(400).json({ error: 'Staff member not available on this day' });
+      }
+      if (sm.services?.length > 0) {
+        const svcId = (service._id || serviceId).toString();
+        if (!sm.services.includes(svcId) && !sm.services.some(sid => sid.toString() === svcId)) {
+          return res.status(400).json({ error: 'Staff member does not provide this service' });
+        }
+      }
+    } else if (business.staff?.length > 0 && !isOwner) {
+      return res.status(400).json({ error: 'Staff selection required' });
+    }
+
     // Calculate end time
     const [h, m] = startTime.split(':').map(Number);
     const endMinutes = h * 60 + m + service.duration;
     const endTime = `${String(Math.floor(endMinutes / 60)).padStart(2, '0')}:${String(endMinutes % 60).padStart(2, '0')}`;
 
-    // Check for conflicts
-    const conflict = await db.collection('appointments').findOne({
+    // Check for conflicts (scoped to staff if provided)
+    const conflictQuery = {
       businessId: business._id,
       date,
       status: { $ne: 'cancelled' },
       startTime: { $lt: endTime },
       endTime: { $gt: startTime }
-    });
+    };
+    if (resolvedStaffId) conflictQuery.staffId = resolvedStaffId;
+    const conflict = await db.collection('appointments').findOne(conflictQuery);
     if (conflict) return res.status(409).json({ error: 'Time slot already booked' });
 
     const appointment = {
       businessId: business._id,
       serviceId: service._id || serviceId,
       serviceName: service.name,
+      staffId: resolvedStaffId,
+      staffName,
       customerName,
       customerPhone,
       customerEmail: customerEmail || '',
@@ -913,11 +955,55 @@ app.delete('/api/businesses/:slug/tasks/:id', authMiddleware, async (req, res) =
   }
 });
 
+// ============ STAFF (PROTECTED) ============
+
+// Get staff — PUBLIC (for booking flow)
+app.get('/api/businesses/:slug/staff', async (req, res) => {
+  try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    const staff = (business.staff || []).filter(s => s.isActive !== false);
+    res.json(staff.map(s => ({
+      _id: s._id, name: s.name, role: s.role, services: s.services || [],
+      workingHours: s.workingHours || {}
+    })));
+  } catch (err) {
+    console.error('Get staff error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update staff — PROTECTED
+app.put('/api/businesses/:slug/staff', authMiddleware, async (req, res) => {
+  try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+
+    const { staff } = req.body;
+    if (!Array.isArray(staff)) return res.status(400).json({ error: 'staff must be an array' });
+
+    const staffWithIds = staff.map(s => ({
+      ...s,
+      _id: s._id ? new ObjectId(s._id) : new ObjectId()
+    }));
+
+    const result = await db.collection('businesses').findOneAndUpdate(
+      { slug: req.params.slug },
+      { $set: { staff: staffWithIds } },
+      { returnDocument: 'after' }
+    );
+    res.json(result);
+  } catch (err) {
+    console.error('Update staff error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ============ AVAILABILITY (PUBLIC) ============
 
 app.get('/api/businesses/:slug/availability', async (req, res) => {
   try {
-    const { date } = req.query;
+    const { date, staffId, serviceId } = req.query;
     if (!date) return res.status(400).json({ error: 'Date parameter required (YYYY-MM-DD)' });
 
     const sanitizedDate = sanitizeQuery(date);
@@ -925,21 +1011,71 @@ app.get('/api/businesses/:slug/availability', async (req, res) => {
     if (!business) return res.status(404).json({ error: 'Business not found' });
 
     const dayOfWeek = new Date(sanitizedDate + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
-    const hours = business.workingHours?.[dayOfWeek];
+    const businessHours = business.workingHours?.[dayOfWeek];
 
-    if (!hours || !hours.enabled) {
-      return res.json({ date: sanitizedDate, available: false, slots: [], message: 'Business closed on this day' });
+    if (!businessHours || !businessHours.enabled) {
+      return res.json({ date: sanitizedDate, available: false, slots: [], availableServices: [], message: 'Business closed on this day' });
     }
 
+    // Determine effective working hours (staff hours override business hours)
+    let effectiveStart = businessHours.start;
+    let effectiveEnd = businessHours.end;
+    let staffMemberFound = null;
+
+    if (staffId && business.staff?.length > 0) {
+      staffMemberFound = business.staff.find(s => s._id?.toString() === sanitizeQuery(staffId));
+      if (staffMemberFound) {
+        const staffHours = staffMemberFound.workingHours?.[dayOfWeek];
+        if (!staffHours || !staffHours.enabled) {
+          return res.json({ date: sanitizedDate, available: false, slots: [], message: 'Staff member not available on this day' });
+        }
+        effectiveStart = staffHours.start;
+        effectiveEnd = staffHours.end;
+      }
+    }
+
+    // Per-day service availability
+    let availableServiceIds = null;
+    if (businessHours.serviceMode === 'custom' && Array.isArray(businessHours.enabledServices)) {
+      availableServiceIds = businessHours.enabledServices.map(id => id.toString());
+    }
+
+    // If serviceId provided, check it's available on this day
+    if (serviceId && availableServiceIds) {
+      if (!availableServiceIds.includes(sanitizeQuery(serviceId))) {
+        return res.json({ date: sanitizedDate, available: false, slots: [], message: 'Service not available on this day' });
+      }
+    }
+
+    // Also check if staff provides the requested service
+    if (serviceId && staffMemberFound && staffMemberFound.services?.length > 0) {
+      if (!staffMemberFound.services.includes(sanitizeQuery(serviceId)) &&
+          !staffMemberFound.services.some(sid => sid.toString() === sanitizeQuery(serviceId))) {
+        return res.json({ date: sanitizedDate, available: false, slots: [], message: 'Staff member does not provide this service' });
+      }
+    }
+
+    // Build appointment query — filter by staffId if provided
+    const aptQuery = { businessId: business._id, date: sanitizedDate, status: { $nin: ['cancelled'] } };
+    if (staffId) aptQuery.staffId = sanitizeQuery(staffId);
+
     const appointments = await db.collection('appointments')
-      .find({ businessId: business._id, date: sanitizedDate, status: { $nin: ['cancelled'] } })
+      .find(aptQuery)
       .toArray();
 
-    const [startH, startM] = hours.start.split(':').map(Number);
-    const [endH, endM] = hours.end.split(':').map(Number);
+    const [startH, startM] = effectiveStart.split(':').map(Number);
+    const [endH, endM] = effectiveEnd.split(':').map(Number);
     const startMinutes = startH * 60 + startM;
     const endMinutes = endH * 60 + endM;
-    const slotDuration = 30;
+    
+    // Use service duration for slot intervals, default 30
+    let slotDuration = 30;
+    if (serviceId) {
+      const svc = (business.services || []).find(s => 
+        s._id?.toString() === serviceId || s.name === serviceId
+      );
+      if (svc && svc.duration) slotDuration = svc.duration;
+    }
 
     const slots = [];
     for (let m = startMinutes; m + slotDuration <= endMinutes; m += slotDuration) {
@@ -949,7 +1085,24 @@ app.get('/api/businesses/:slug/availability', async (req, res) => {
       slots.push({ start: slotStart, end: slotEnd, available: !isBooked });
     }
 
-    res.json({ date: sanitizedDate, dayOfWeek, available: true, slots });
+    // Build available services for this day
+    const availableServices = availableServiceIds
+      ? (business.services || []).filter(s => availableServiceIds.includes(s._id?.toString())).map(s => ({ _id: s._id, name: s.name, duration: s.duration, price: s.price }))
+      : (business.services || []).map(s => ({ _id: s._id, name: s.name, duration: s.duration, price: s.price }));
+
+    // Build available staff for this day + service
+    const availableStaff = (business.staff || []).filter(s => {
+      if (s.isActive === false) return false;
+      const sh = s.workingHours?.[dayOfWeek];
+      if (sh && !sh.enabled) return false;
+      if (serviceId && s.services?.length > 0) {
+        const sid = sanitizeQuery(serviceId);
+        if (!s.services.includes(sid) && !s.services.some(id => id.toString() === sid)) return false;
+      }
+      return true;
+    }).map(s => ({ _id: s._id, name: s.name, role: s.role }));
+
+    res.json({ date: sanitizedDate, dayOfWeek, available: true, slots, availableServices, availableStaff });
   } catch (err) {
     console.error('Availability error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -1068,6 +1221,50 @@ app.post('/api/reminders/mark-sent', async (req, res) => {
     console.error('Mark reminder error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ============ ADMIN ============
+
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'snaptor2026';
+const ADMIN_JWT_SECRET = JWT_SECRET + '-admin';
+
+function adminAuth(req, res, next) {
+  const token = req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    const decoded = jwt.verify(token, ADMIN_JWT_SECRET);
+    if (!decoded.admin) return res.status(401).json({ error: 'Not admin' });
+    next();
+  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+}
+
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body;
+  if (password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
+  const token = jwt.sign({ admin: true }, ADMIN_JWT_SECRET, { expiresIn: '24h' });
+  res.json({ token });
+});
+
+app.get('/api/admin/data', adminAuth, async (req, res) => {
+  try {
+    const [businesses, customers, appointments] = await Promise.all([
+      db.collection('businesses').find({}).toArray(),
+      db.collection('customers').find({}).toArray(),
+      db.collection('appointments').find({}).toArray().then(a => a.sort((x,y) => (y.date+y.startTime).localeCompare(x.date+x.startTime)).slice(0, 200)),
+    ]);
+    // Convert ObjectIds to strings for frontend matching
+    businesses.forEach(b => { b._id = b._id.toString(); });
+    appointments.forEach(a => { a._id = a._id.toString(); a.businessId = a.businessId?.toString(); });
+    res.json({ businesses, customers, appointments });
+  } catch (err) {
+    console.error('Admin data error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Admin route
+app.get('/admin', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
 // ============ HEALTH CHECK ============

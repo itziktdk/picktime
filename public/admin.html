@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Snaptor Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --accent: #6366f1; --accent-light: #818cf8; --accent-dark: #4f46e5;
+  --bg: #f8fafc; --card: #ffffff; --text: #0f172a; --text2: #64748b; --text3: #94a3b8;
+  --border: #e2e8f0; --success: #10b981; --danger: #ef4444;
+  --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-lg: 0 4px 12px rgba(0,0,0,0.08);
+}
+body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+/* Login */
+#login-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+.login-box { background: var(--card); padding: 48px; border-radius: 20px; box-shadow: var(--shadow-lg); text-align: center; max-width: 380px; width: 90%; }
+.login-box h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; }
+.login-box p { color: var(--text2); margin-bottom: 24px; font-size: 14px; }
+.login-box input { width: 100%; padding: 12px 16px; border: 1px solid var(--border); border-radius: 12px; font-family: 'Inter', sans-serif; font-size: 15px; text-align: center; letter-spacing: 2px; outline: none; transition: border 0.2s; }
+.login-box input:focus { border-color: var(--accent); }
+.login-box button { width: 100%; margin-top: 16px; padding: 12px; background: var(--accent); color: white; border: none; border-radius: 12px; font-family: 'Heebo', sans-serif; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+.login-box button:hover { background: var(--accent-dark); }
+.login-error { color: var(--danger); font-size: 13px; margin-top: 12px; display: none; }
+
+/* Dashboard */
+#dashboard { display: none; }
+.top-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 10; }
+.top-bar h1 { font-size: 20px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+.top-bar h1 span { color: var(--accent); }
+.logout-btn { background: none; border: 1px solid var(--border); padding: 8px 16px; border-radius: 10px; font-family: 'Heebo', sans-serif; font-size: 13px; cursor: pointer; color: var(--text2); transition: all 0.2s; }
+.logout-btn:hover { border-color: var(--danger); color: var(--danger); }
+
+.container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+
+/* Stats */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 32px; }
+.stat-card { background: var(--card); border-radius: 16px; padding: 20px; box-shadow: var(--shadow); }
+.stat-card .label { font-size: 13px; color: var(--text2); margin-bottom: 4px; }
+.stat-card .value { font-size: 32px; font-weight: 700; color: var(--accent); font-family: 'Inter', sans-serif; }
+.stat-card .sub { font-size: 12px; color: var(--text3); margin-top: 4px; }
+
+/* Tabs */
+.tabs { display: flex; gap: 4px; margin-bottom: 24px; background: var(--card); border-radius: 12px; padding: 4px; box-shadow: var(--shadow); }
+.tab { flex: 1; padding: 10px; text-align: center; border-radius: 10px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; color: var(--text2); }
+.tab.active { background: var(--accent); color: white; }
+.tab:hover:not(.active) { background: var(--bg); }
+
+/* Table */
+.table-wrap { background: var(--card); border-radius: 16px; box-shadow: var(--shadow); overflow: hidden; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { background: var(--bg); padding: 12px 16px; text-align: right; font-weight: 600; color: var(--text2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: #f8faff; }
+.badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; }
+.badge-active { background: #d1fae5; color: #065f46; }
+.badge-type { background: #e0e7ff; color: #3730a3; }
+
+/* Empty state */
+.empty { text-align: center; padding: 48px 24px; color: var(--text3); }
+.empty svg { width: 48px; height: 48px; margin-bottom: 12px; opacity: 0.4; }
+
+/* Responsive */
+@media (max-width: 640px) {
+  .container { padding: 16px; }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  table { font-size: 13px; }
+  th, td { padding: 10px 12px; }
+}
+
+/* Loading */
+.spinner { width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; margin: 24px auto; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-box">
+    <h1>Snaptor Admin</h1>
+    <p>לוח בקרה לניהול המערכת</p>
+    <input type="password" id="password-input" placeholder="סיסמה" autofocus>
+    <button onclick="doLogin()">כניסה</button>
+    <div class="login-error" id="login-error">סיסמה שגויה</div>
+  </div>
+</div>
+
+<div id="dashboard">
+  <div class="top-bar">
+    <h1><span>●</span> Snaptor Admin</h1>
+    <button class="logout-btn" onclick="doLogout()">יציאה</button>
+  </div>
+  <div class="container">
+    <div class="stats" id="stats">
+      <div class="stat-card"><div class="label">עסקים</div><div class="value" id="s-biz">-</div></div>
+      <div class="stat-card"><div class="label">לקוחות</div><div class="value" id="s-cust">-</div></div>
+      <div class="stat-card"><div class="label">תורים</div><div class="value" id="s-appt">-</div></div>
+      <div class="stat-card"><div class="label">תורים השבוע</div><div class="value" id="s-week">-</div></div>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="businesses" onclick="switchTab('businesses')">עסקים</div>
+      <div class="tab" data-tab="customers" onclick="switchTab('customers')">לקוחות</div>
+      <div class="tab" data-tab="appointments" onclick="switchTab('appointments')">תורים</div>
+    </div>
+
+    <div id="tab-content">
+      <div class="spinner"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '/api/admin';
+let token = sessionStorage.getItem('admin_token');
+let data = {};
+
+// Login
+function doLogin() {
+  const pw = document.getElementById('password-input').value;
+  fetch(API + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) })
+    .then(r => r.json())
+    .then(d => {
+      if (d.token) {
+        token = d.token;
+        sessionStorage.setItem('admin_token', token);
+        showDashboard();
+      } else {
+        document.getElementById('login-error').style.display = 'block';
+      }
+    }).catch(() => { document.getElementById('login-error').style.display = 'block'; });
+}
+
+document.getElementById('password-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+function doLogout() { token = null; sessionStorage.removeItem('admin_token'); location.reload(); }
+
+function authHeaders() { return { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }; }
+
+async function showDashboard() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
+  try {
+    const r = await fetch(API + '/data', { headers: authHeaders() });
+    if (r.status === 401) { doLogout(); return; }
+    data = await r.json();
+    renderStats();
+    switchTab('businesses');
+  } catch (e) { console.error(e); }
+}
+
+function renderStats() {
+  document.getElementById('s-biz').textContent = data.businesses?.length || 0;
+  document.getElementById('s-cust').textContent = data.customers?.length || 0;
+  document.getElementById('s-appt').textContent = data.appointments?.length || 0;
+  const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
+  const weekAppts = (data.appointments || []).filter(a => a.date >= weekAgo).length;
+  document.getElementById('s-week').textContent = weekAppts;
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+  const el = document.getElementById('tab-content');
+  if (tab === 'businesses') renderBusinesses(el);
+  else if (tab === 'customers') renderCustomers(el);
+  else if (tab === 'appointments') renderAppointments(el);
+}
+
+function formatDate(d) { if (!d) return '-'; try { return new Date(d).toLocaleDateString('he-IL'); } catch { return d; } }
+
+function renderBusinesses(el) {
+  const biz = data.businesses || [];
+  if (!biz.length) { el.innerHTML = '<div class="empty">אין עסקים</div>'; return; }
+  el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>שם</th><th>Slug</th><th>סוג</th><th>טלפון</th><th>שירותים</th><th>נוצר</th></tr></thead><tbody>' +
+    biz.map(b => `<tr>
+      <td><strong>${esc(b.name)}</strong></td>
+      <td style="font-family:Inter,monospace;font-size:13px;color:var(--accent)">${esc(b.slug)}</td>
+      <td><span class="badge badge-type">${esc(b.type || '-')}</span></td>
+      <td style="direction:ltr;text-align:right">${esc(b.phone || '-')}</td>
+      <td>${(b.services||[]).length}</td>
+      <td>${formatDate(b.createdAt)}</td>
+    </tr>`).join('') +
+    '</tbody></table></div>';
+}
+
+function renderCustomers(el) {
+  const custs = data.customers || [];
+  if (!custs.length) { el.innerHTML = '<div class="empty">אין לקוחות</div>'; return; }
+  el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>שם</th><th>טלפון</th><th>עסק</th><th>ביקורים</th><th>הוצאות</th><th>ביקור אחרון</th></tr></thead><tbody>' +
+    custs.map(c => {
+      const biz = (data.businesses||[]).find(b => b._id === c.businessId);
+      return `<tr>
+        <td><strong>${esc(c.name)}</strong>${c.isVip ? ' ⭐' : ''}</td>
+        <td style="direction:ltr;text-align:right">${esc(c.phone || '-')}</td>
+        <td>${esc(biz?.name || c.businessId || '-')}</td>
+        <td>${c.totalVisits || 0}</td>
+        <td>₪${c.totalSpent || 0}</td>
+        <td>${formatDate(c.lastVisit)}</td>
+      </tr>`;
+    }).join('') +
+    '</tbody></table></div>';
+}
+
+function renderAppointments(el) {
+  const appts = (data.appointments || []).sort((a, b) => (b.date + b.startTime).localeCompare(a.date + a.startTime));
+  if (!appts.length) { el.innerHTML = '<div class="empty">אין תורים</div>'; return; }
+  const statusMap = { pending: '⏳ ממתין', confirmed: '✅ מאושר', cancelled: '❌ בוטל', completed: '✔️ הושלם' };
+  el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>תאריך</th><th>שעה</th><th>לקוח</th><th>שירות</th><th>עסק</th><th>סטטוס</th></tr></thead><tbody>' +
+    appts.map(a => {
+      const biz = (data.businesses||[]).find(b => b._id === a.businessId || b._id === a.businessId?.toString());
+      return `<tr>
+        <td>${esc(a.date || '-')}</td>
+        <td>${esc(a.startTime || '-')} - ${esc(a.endTime || '-')}</td>
+        <td><strong>${esc(a.customerName || '-')}</strong><br><small style="color:var(--text3)">${esc(a.customerPhone || '')}</small></td>
+        <td>${esc(a.serviceName || '-')}</td>
+        <td>${esc(biz?.name || '-')}</td>
+        <td>${statusMap[a.status] || a.status}</td>
+      </tr>`;
+    }).join('') +
+    '</tbody></table></div>';
+}
+
+function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// Auto-login if token exists
+if (token) showDashboard();
+</script>
+</body>
+</html>
