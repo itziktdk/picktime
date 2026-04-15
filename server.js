@@ -1116,18 +1116,19 @@ app.get('/api/businesses/:slug/stats', authMiddleware, async (req, res) => {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
 
-    const bid = business._id.toString();
+    const bid = business._id;
+    const bidStr = business._id.toString();
     const now = new Date();
     const weekAgoStr = new Date(now - 7 * 86400000).toISOString().split('T')[0];
 
     const [weekAppts, weekCancelled, weekCustomers] = await Promise.all([
-      db.collection('appointments').countDocuments({ businessId: bid, date: { $gte: weekAgoStr } }),
-      db.collection('appointments').countDocuments({ businessId: bid, status: 'cancelled', date: { $gte: weekAgoStr } }),
-      db.collection('customers').countDocuments({ businessId: bid, createdAt: { $gte: new Date(now - 7 * 86400000) } })
+      db.collection('appointments').countDocuments({ businessId: { $in: [bid, bidStr] }, date: { $gte: weekAgoStr } }),
+      db.collection('appointments').countDocuments({ businessId: { $in: [bid, bidStr] }, status: 'cancelled', date: { $gte: weekAgoStr } }),
+      db.collection('customers').countDocuments({ businessId: { $in: [bid, bidStr] }, createdAt: { $gte: new Date(now - 7 * 86400000) } })
     ]);
 
     const confirmed = await db.collection('appointments').find({
-      businessId: bid, status: 'confirmed', date: { $gte: weekAgoStr }
+      businessId: { $in: [bid, bidStr] }, status: 'confirmed', date: { $gte: weekAgoStr }
     }).toArray();
     let revenue = 0;
     for (const appt of confirmed) {
