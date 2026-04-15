@@ -1268,6 +1268,26 @@ app.get('/api/admin/data', adminAuth, async (req, res) => {
   }
 });
 
+app.delete('/api/admin/businesses/:id', adminAuth, async (req, res) => {
+  try {
+    const bid = req.params.id;
+    const business = await db.collection('businesses').findOne({ _id: new ObjectId(bid) });
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    const bidObj = new ObjectId(bid);
+    await Promise.all([
+      db.collection('businesses').deleteOne({ _id: bidObj }),
+      db.collection('appointments').deleteMany({ businessId: { $in: [bidObj, bid] } }),
+      db.collection('customers').deleteMany({ businessId: { $in: [bidObj, bid] } }),
+      db.collection('tasks').deleteMany({ businessId: { $in: [bidObj, bid] } }),
+      db.collection('announcements').deleteMany({ businessId: { $in: [bidObj, bid] } }),
+    ]);
+    res.json({ success: true, deleted: business.slug });
+  } catch (err) {
+    console.error('Admin delete business error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Admin route
 app.get('/admin', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));

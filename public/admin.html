@@ -181,7 +181,7 @@ function formatDate(d) { if (!d) return '-'; try { return new Date(d).toLocaleDa
 function renderBusinesses(el) {
   const biz = data.businesses || [];
   if (!biz.length) { el.innerHTML = '<div class="empty">אין עסקים</div>'; return; }
-  el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>שם</th><th>Slug</th><th>סוג</th><th>טלפון</th><th>שירותים</th><th>נוצר</th></tr></thead><tbody>' +
+  el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>שם</th><th>Slug</th><th>סוג</th><th>טלפון</th><th>שירותים</th><th>נוצר</th><th></th></tr></thead><tbody>' +
     biz.map(b => `<tr>
       <td><strong>${esc(b.name)}</strong></td>
       <td style="font-family:Inter,monospace;font-size:13px;color:var(--accent)">${esc(b.slug)}</td>
@@ -189,6 +189,7 @@ function renderBusinesses(el) {
       <td style="direction:ltr;text-align:right">${esc(b.phone || '-')}</td>
       <td>${(b.services||[]).length}</td>
       <td>${formatDate(b.createdAt)}</td>
+      <td><button onclick="deleteBusiness('${b._id}','${esc(b.name)}')" style="background:none;border:1px solid var(--border);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;color:var(--danger)">מחק</button></td>
     </tr>`).join('') +
     '</tbody></table></div>';
 }
@@ -231,6 +232,15 @@ function renderAppointments(el) {
 }
 
 function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+async function deleteBusiness(id, name) {
+  if (!confirm(`\u05d1\u05d8\u05d5\u05d7 \u05e9\u05e8\u05d5\u05e6\u05d4 \u05dc\u05de\u05d7\u05d5\u05e7 \u05d0\u05ea "${name}"? \u05d6\u05d4 \u05d9\u05de\u05d7\u05e7 \u05d2\u05dd \u05d0\u05ea \u05db\u05dc \u05d4\u05ea\u05d5\u05e8\u05d9\u05dd \u05d5\u05d4\u05dc\u05e7\u05d5\u05d7\u05d5\u05ea.`)) return;
+  try {
+    const r = await fetch(`${API}/businesses/${id}`, { method: 'DELETE', headers: authHeaders() });
+    if (r.ok) showDashboard();
+    else alert('\u05e9\u05d2\u05d9\u05d0\u05d4 \u05d1\u05de\u05d7\u05d9\u05e7\u05d4');
+  } catch { alert('\u05e9\u05d2\u05d9\u05d0\u05d4 \u05d1\u05de\u05d7\u05d9\u05e7\u05d4'); }
+}
 
 // Auto-login if token exists
 if (token) showDashboard();
