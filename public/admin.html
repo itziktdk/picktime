@@ -10,7 +10,7 @@
 :root {
   --accent: #6366f1; --accent-light: #818cf8; --accent-dark: #4f46e5;
   --bg: #f8fafc; --card: #ffffff; --text: #0f172a; --text2: #64748b; --text3: #94a3b8;
-  --border: #e2e8f0; --success: #10b981; --danger: #ef4444;
+  --border: #e2e8f0; --success: #10b981; --danger: #ef4444; --warn: #f59e0b;
   --shadow: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
   --shadow-lg: 0 4px 12px rgba(0,0,0,0.08);
 }
@@ -35,7 +35,7 @@ body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--tex
 .logout-btn { background: none; border: 1px solid var(--border); padding: 8px 16px; border-radius: 10px; font-family: 'Heebo', sans-serif; font-size: 13px; cursor: pointer; color: var(--text2); transition: all 0.2s; }
 .logout-btn:hover { border-color: var(--danger); color: var(--danger); }
 
-.container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+.container { max-width: 1200px; margin: 0 auto; padding: 24px; }
 
 /* Stats */
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 32px; }
@@ -45,32 +45,80 @@ body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--tex
 .stat-card .sub { font-size: 12px; color: var(--text3); margin-top: 4px; }
 
 /* Tabs */
-.tabs { display: flex; gap: 4px; margin-bottom: 24px; background: var(--card); border-radius: 12px; padding: 4px; box-shadow: var(--shadow); }
+.tabs { display: flex; gap: 4px; margin-bottom: 16px; background: var(--card); border-radius: 12px; padding: 4px; box-shadow: var(--shadow); }
 .tab { flex: 1; padding: 10px; text-align: center; border-radius: 10px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; color: var(--text2); }
 .tab.active { background: var(--accent); color: white; }
 .tab:hover:not(.active) { background: var(--bg); }
 
+/* Search */
+.search-bar { margin-bottom: 16px; }
+.search-bar input { width: 100%; padding: 10px 16px; border: 1px solid var(--border); border-radius: 12px; font-family: 'Heebo', sans-serif; font-size: 14px; outline: none; background: var(--card); transition: border 0.2s; }
+.search-bar input:focus { border-color: var(--accent); }
+
 /* Table */
-.table-wrap { background: var(--card); border-radius: 16px; box-shadow: var(--shadow); overflow: hidden; }
+.table-wrap { background: var(--card); border-radius: 16px; box-shadow: var(--shadow); overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
-th { background: var(--bg); padding: 12px 16px; text-align: right; font-weight: 600; color: var(--text2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+th { background: var(--bg); padding: 12px 16px; text-align: right; font-weight: 600; color: var(--text2); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; white-space: nowrap; }
+th:hover { color: var(--accent); }
+th .sort-icon { margin-inline-start: 4px; font-size: 10px; opacity: 0.5; }
+th .sort-icon.active { opacity: 1; color: var(--accent); }
 td { padding: 12px 16px; border-bottom: 1px solid var(--border); }
 tr:last-child td { border-bottom: none; }
 tr:hover td { background: #f8faff; }
 .badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; }
 .badge-active { background: #d1fae5; color: #065f46; }
+.badge-inactive { background: #fee2e2; color: #991b1b; }
 .badge-type { background: #e0e7ff; color: #3730a3; }
+
+/* Status dot */
+.status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-inline-end: 6px; vertical-align: middle; }
+.status-dot.active { background: var(--success); }
+.status-dot.inactive { background: var(--danger); }
+
+/* Action buttons */
+.actions { display: flex; gap: 6px; flex-wrap: nowrap; }
+.btn-sm { background: none; border: 1px solid var(--border); border-radius: 8px; padding: 4px 10px; font-size: 12px; cursor: pointer; font-family: 'Heebo', sans-serif; transition: all 0.2s; white-space: nowrap; }
+.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+.btn-sm.danger { color: var(--danger); }
+.btn-sm.danger:hover { border-color: var(--danger); background: #fef2f2; }
+.btn-sm.toggle { color: var(--warn); }
+.btn-sm.toggle:hover { border-color: var(--warn); background: #fffbeb; }
+
+/* Modal overlay */
+.modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 100; align-items: center; justify-content: center; backdrop-filter: blur(2px); }
+.modal-overlay.show { display: flex; }
+.modal { background: var(--card); border-radius: 20px; padding: 32px; max-width: 440px; width: 90%; box-shadow: 0 20px 60px rgba(0,0,0,0.15); animation: modalIn 0.2s ease-out; }
+@keyframes modalIn { from { opacity: 0; transform: scale(0.95) translateY(10px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+.modal h2 { font-size: 18px; font-weight: 700; margin-bottom: 20px; }
+.modal .field { margin-bottom: 14px; }
+.modal .field label { display: block; font-size: 13px; font-weight: 500; color: var(--text2); margin-bottom: 4px; }
+.modal .field input, .modal .field select { width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 10px; font-family: 'Heebo', sans-serif; font-size: 14px; outline: none; transition: border 0.2s; }
+.modal .field input:focus, .modal .field select:focus { border-color: var(--accent); }
+.modal-actions { display: flex; gap: 10px; margin-top: 20px; }
+.modal-actions button { flex: 1; padding: 10px; border-radius: 10px; font-family: 'Heebo', sans-serif; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; border: none; }
+.btn-primary { background: var(--accent); color: white; }
+.btn-primary:hover { background: var(--accent-dark); }
+.btn-cancel { background: var(--bg); color: var(--text2); border: 1px solid var(--border) !important; }
+.btn-cancel:hover { background: var(--border); }
+.btn-danger { background: var(--danger); color: white; }
+.btn-danger:hover { background: #dc2626; }
+.modal-error { color: var(--danger); font-size: 13px; margin-top: 8px; display: none; }
 
 /* Empty state */
 .empty { text-align: center; padding: 48px 24px; color: var(--text3); }
-.empty svg { width: 48px; height: 48px; margin-bottom: 12px; opacity: 0.4; }
+
+/* Toast */
+.toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--text); color: white; padding: 12px 24px; border-radius: 12px; font-size: 14px; z-index: 200; animation: toastIn 0.3s ease-out; box-shadow: var(--shadow-lg); }
+@keyframes toastIn { from { opacity: 0; transform: translateX(-50%) translateY(20px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
 
 /* Responsive */
-@media (max-width: 640px) {
+@media (max-width: 768px) {
   .container { padding: 16px; }
   .stats { grid-template-columns: repeat(2, 1fr); }
   table { font-size: 13px; }
   th, td { padding: 10px 12px; }
+  .modal { padding: 24px; }
+  .actions { flex-wrap: wrap; }
 }
 
 /* Loading */
@@ -101,7 +149,7 @@ tr:hover td { background: #f8faff; }
   </div>
   <div class="container">
     <div class="stats" id="stats">
-      <div class="stat-card"><div class="label">עסקים</div><div class="value" id="s-biz">-</div></div>
+      <div class="stat-card"><div class="label">עסקים</div><div class="value" id="s-biz">-</div><div class="sub" id="s-biz-sub"></div></div>
       <div class="stat-card"><div class="label">לקוחות</div><div class="value" id="s-cust">-</div></div>
       <div class="stat-card"><div class="label">תורים</div><div class="value" id="s-appt">-</div></div>
       <div class="stat-card"><div class="label">תורים השבוע</div><div class="value" id="s-week">-</div></div>
@@ -113,8 +161,50 @@ tr:hover td { background: #f8faff; }
       <div class="tab" data-tab="appointments" onclick="switchTab('appointments')">תורים</div>
     </div>
 
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="חיפוש..." oninput="onSearch()">
+    </div>
+
     <div id="tab-content">
       <div class="spinner"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Business Modal -->
+<div class="modal-overlay" id="edit-modal">
+  <div class="modal">
+    <h2>✏️ עריכת עסק</h2>
+    <input type="hidden" id="edit-id">
+    <div class="field"><label>שם העסק</label><input type="text" id="edit-name"></div>
+    <div class="field"><label>טלפון</label><input type="tel" id="edit-phone" dir="ltr" style="text-align:right"></div>
+    <div class="field"><label>סוג</label><select id="edit-type">
+      <option value="barbershop">מספרה</option>
+      <option value="nail_salon">מניקור/פדיקור</option>
+      <option value="beauty_salon">סלון יופי</option>
+      <option value="spa">ספא</option>
+      <option value="clinic">קליניקה</option>
+      <option value="other">אחר</option>
+    </select></div>
+    <div class="field"><label>Slug (כתובת)</label><input type="text" id="edit-slug" dir="ltr" style="text-align:right"></div>
+    <div class="modal-error" id="edit-error"></div>
+    <div class="modal-actions">
+      <button class="btn-primary" onclick="saveEdit()">שמירה</button>
+      <button class="btn-cancel" onclick="closeModal('edit-modal')">ביטול</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete Confirmation Modal -->
+<div class="modal-overlay" id="delete-modal">
+  <div class="modal">
+    <h2>🗑️ מחיקת עסק</h2>
+    <p style="margin-bottom:8px">בטוח שרוצה למחוק את <strong id="delete-name"></strong>?</p>
+    <p style="color:var(--danger);font-size:13px">⚠️ פעולה זו תמחק גם את כל התורים והלקוחות של העסק. אין דרך חזרה!</p>
+    <input type="hidden" id="delete-id">
+    <div class="modal-actions" style="margin-top:24px">
+      <button class="btn-danger" onclick="confirmDelete()">כן, מחק</button>
+      <button class="btn-cancel" onclick="closeModal('delete-modal')">ביטול</button>
     </div>
   </div>
 </div>
@@ -123,6 +213,9 @@ tr:hover td { background: #f8faff; }
 const API = '/api/admin';
 let token = sessionStorage.getItem('admin_token');
 let data = {};
+let currentTab = 'businesses';
+let searchQuery = '';
+let sortCol = null, sortDir = 1;
 
 // Login
 function doLogin() {
@@ -130,20 +223,12 @@ function doLogin() {
   fetch(API + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw }) })
     .then(r => r.json())
     .then(d => {
-      if (d.token) {
-        token = d.token;
-        sessionStorage.setItem('admin_token', token);
-        showDashboard();
-      } else {
-        document.getElementById('login-error').style.display = 'block';
-      }
+      if (d.token) { token = d.token; sessionStorage.setItem('admin_token', token); showDashboard(); }
+      else { document.getElementById('login-error').style.display = 'block'; }
     }).catch(() => { document.getElementById('login-error').style.display = 'block'; });
 }
-
 document.getElementById('password-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
-
 function doLogout() { token = null; sessionStorage.removeItem('admin_token'); location.reload(); }
-
 function authHeaders() { return { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }; }
 
 async function showDashboard() {
@@ -155,55 +240,138 @@ async function showDashboard() {
     data = await r.json();
     renderStats();
     document.getElementById('last-update').textContent = 'עודכן: ' + new Date().toLocaleTimeString('he-IL');
-    switchTab('businesses');
+    switchTab(currentTab);
   } catch (e) { console.error(e); }
 }
 
 function renderStats() {
-  document.getElementById('s-biz').textContent = data.businesses?.length || 0;
+  const biz = data.businesses || [];
+  const activeBiz = biz.filter(b => b.isActive !== false).length;
+  document.getElementById('s-biz').textContent = biz.length;
+  document.getElementById('s-biz-sub').textContent = `${activeBiz} פעילים`;
   document.getElementById('s-cust').textContent = data.customers?.length || 0;
   document.getElementById('s-appt').textContent = data.appointments?.length || 0;
   const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().split('T')[0];
-  const weekAppts = (data.appointments || []).filter(a => a.date >= weekAgo).length;
-  document.getElementById('s-week').textContent = weekAppts;
+  document.getElementById('s-week').textContent = (data.appointments || []).filter(a => a.date >= weekAgo).length;
 }
 
 function switchTab(tab) {
+  currentTab = tab;
+  sortCol = null; sortDir = 1;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-  const el = document.getElementById('tab-content');
-  if (tab === 'businesses') renderBusinesses(el);
-  else if (tab === 'customers') renderCustomers(el);
-  else if (tab === 'appointments') renderAppointments(el);
+  renderCurrentTab();
 }
 
+function onSearch() {
+  searchQuery = document.getElementById('search-input').value.toLowerCase();
+  renderCurrentTab();
+}
+
+function renderCurrentTab() {
+  const el = document.getElementById('tab-content');
+  if (currentTab === 'businesses') renderBusinesses(el);
+  else if (currentTab === 'customers') renderCustomers(el);
+  else if (currentTab === 'appointments') renderAppointments(el);
+}
+
+function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function formatDate(d) { if (!d) return '-'; try { return new Date(d).toLocaleDateString('he-IL'); } catch { return d; } }
 
+function relativeTime(d) {
+  if (!d) return 'אף פעם';
+  const diff = Date.now() - new Date(d).getTime();
+  if (diff < 0) return 'עכשיו';
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'עכשיו';
+  if (mins < 60) return `לפני ${mins} דקות`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `לפני ${hrs} שעות`;
+  const days = Math.floor(hrs / 24);
+  if (days < 30) return `לפני ${days} ימים`;
+  const months = Math.floor(days / 30);
+  return `לפני ${months} חודשים`;
+}
+
+function sortIcon(col) {
+  if (sortCol !== col) return '<span class="sort-icon">⇅</span>';
+  return `<span class="sort-icon active">${sortDir === 1 ? '▲' : '▼'}</span>`;
+}
+
+function toggleSort(col) {
+  if (sortCol === col) sortDir *= -1;
+  else { sortCol = col; sortDir = 1; }
+  renderCurrentTab();
+}
+
+function sortData(arr, col) {
+  if (!sortCol) return arr;
+  return [...arr].sort((a, b) => {
+    let va = a[col] ?? '', vb = b[col] ?? '';
+    if (typeof va === 'string') va = va.toLowerCase();
+    if (typeof vb === 'string') vb = vb.toLowerCase();
+    if (va < vb) return -1 * sortDir;
+    if (va > vb) return 1 * sortDir;
+    return 0;
+  });
+}
+
 function renderBusinesses(el) {
-  const biz = data.businesses || [];
+  let biz = data.businesses || [];
+  if (searchQuery) {
+    biz = biz.filter(b => (b.name||'').toLowerCase().includes(searchQuery) || (b.slug||'').toLowerCase().includes(searchQuery) || (b.phone||'').includes(searchQuery) || (b.type||'').toLowerCase().includes(searchQuery));
+  }
+  biz = sortData(biz, sortCol);
   if (!biz.length) { el.innerHTML = '<div class="empty">אין עסקים</div>'; return; }
-  el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>שם</th><th>Slug</th><th>סוג</th><th>טלפון</th><th>שירותים</th><th>נוצר</th><th></th></tr></thead><tbody>' +
-    biz.map(b => `<tr>
-      <td><strong>${esc(b.name)}</strong></td>
-      <td style="font-family:Inter,monospace;font-size:13px;color:var(--accent)">${esc(b.slug)}</td>
-      <td><span class="badge badge-type">${esc(b.type || '-')}</span></td>
-      <td style="direction:ltr;text-align:right">${esc(b.phone || '-')}</td>
-      <td>${(b.services||[]).length}</td>
-      <td>${formatDate(b.createdAt)}</td>
-      <td><button onclick="deleteBusiness('${b._id}','${esc(b.name)}')" style="background:none;border:1px solid var(--border);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;color:var(--danger)">מחק</button></td>
-    </tr>`).join('') +
+  el.innerHTML = '<div class="table-wrap"><table><thead><tr>' +
+    `<th onclick="toggleSort('name')">שם ${sortIcon('name')}</th>` +
+    `<th onclick="toggleSort('slug')">Slug ${sortIcon('slug')}</th>` +
+    `<th onclick="toggleSort('type')">סוג ${sortIcon('type')}</th>` +
+    `<th>טלפון</th>` +
+    `<th>שירותים</th>` +
+    `<th onclick="toggleSort('lastLogin')">כניסה אחרונה ${sortIcon('lastLogin')}</th>` +
+    `<th onclick="toggleSort('createdAt')">נוצר ${sortIcon('createdAt')}</th>` +
+    `<th>פעולות</th>` +
+    '</tr></thead><tbody>' +
+    biz.map(b => {
+      const active = b.isActive !== false;
+      return `<tr style="${!active ? 'opacity:0.55' : ''}">
+        <td><span class="status-dot ${active ? 'active' : 'inactive'}"></span><strong>${esc(b.name)}</strong></td>
+        <td style="font-family:Inter,monospace;font-size:13px;color:var(--accent)">${esc(b.slug)}</td>
+        <td><span class="badge badge-type">${esc(b.type || '-')}</span></td>
+        <td style="direction:ltr;text-align:right">${esc(b.phone || '-')}</td>
+        <td>${(b.services||[]).length}</td>
+        <td style="font-size:12px;color:var(--text2)">${relativeTime(b.lastLogin)}</td>
+        <td>${formatDate(b.createdAt)}</td>
+        <td class="actions">
+          <button class="btn-sm" onclick='openEdit(${JSON.stringify(b).replace(/'/g,"&#39;")})'>✏️</button>
+          <button class="btn-sm toggle" onclick="toggleBusiness('${b._id}')">${active ? '⏸️' : '▶️'}</button>
+          <button class="btn-sm danger" onclick="openDelete('${b._id}',\`${esc(b.name)}\`)">🗑️</button>
+        </td>
+      </tr>`;
+    }).join('') +
     '</tbody></table></div>';
 }
 
 function renderCustomers(el) {
-  const custs = data.customers || [];
+  let custs = data.customers || [];
+  if (searchQuery) {
+    custs = custs.filter(c => (c.name||'').toLowerCase().includes(searchQuery) || (c.phone||'').includes(searchQuery));
+  }
+  custs = sortData(custs, sortCol);
   if (!custs.length) { el.innerHTML = '<div class="empty">אין לקוחות</div>'; return; }
-  el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>שם</th><th>טלפון</th><th>עסק</th><th>ביקורים</th><th>הוצאות</th><th>ביקור אחרון</th></tr></thead><tbody>' +
+  el.innerHTML = '<div class="table-wrap"><table><thead><tr>' +
+    `<th onclick="toggleSort('name')">שם ${sortIcon('name')}</th>` +
+    '<th>טלפון</th><th>עסק</th>' +
+    `<th onclick="toggleSort('totalVisits')">ביקורים ${sortIcon('totalVisits')}</th>` +
+    `<th onclick="toggleSort('totalSpent')">הוצאות ${sortIcon('totalSpent')}</th>` +
+    `<th onclick="toggleSort('lastVisit')">ביקור אחרון ${sortIcon('lastVisit')}</th>` +
+    '</tr></thead><tbody>' +
     custs.map(c => {
       const biz = (data.businesses||[]).find(b => b._id === c.businessId);
       return `<tr>
         <td><strong>${esc(c.name)}</strong>${c.isVip ? ' ⭐' : ''}</td>
         <td style="direction:ltr;text-align:right">${esc(c.phone || '-')}</td>
-        <td>${esc(biz?.name || c.businessId || '-')}</td>
+        <td>${esc(biz?.name || '-')}</td>
         <td>${c.totalVisits || 0}</td>
         <td>₪${c.totalSpent || 0}</td>
         <td>${formatDate(c.lastVisit)}</td>
@@ -213,7 +381,10 @@ function renderCustomers(el) {
 }
 
 function renderAppointments(el) {
-  const appts = (data.appointments || []).sort((a, b) => (b.date + b.startTime).localeCompare(a.date + a.startTime));
+  let appts = (data.appointments || []).sort((a, b) => (b.date + b.startTime).localeCompare(a.date + a.startTime));
+  if (searchQuery) {
+    appts = appts.filter(a => (a.customerName||'').toLowerCase().includes(searchQuery) || (a.customerPhone||'').includes(searchQuery) || (a.serviceName||'').toLowerCase().includes(searchQuery));
+  }
   if (!appts.length) { el.innerHTML = '<div class="empty">אין תורים</div>'; return; }
   const statusMap = { pending: '⏳ ממתין', confirmed: '✅ מאושר', cancelled: '❌ בוטל', completed: '✔️ הושלם' };
   el.innerHTML = '<div class="table-wrap"><table><thead><tr><th>תאריך</th><th>שעה</th><th>לקוח</th><th>שירות</th><th>עסק</th><th>סטטוס</th></tr></thead><tbody>' +
@@ -231,16 +402,84 @@ function renderAppointments(el) {
     '</tbody></table></div>';
 }
 
-function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+// Modal helpers
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+function showModal(id) { document.getElementById(id).classList.add('show'); }
 
-async function deleteBusiness(id, name) {
-  if (!confirm(`\u05d1\u05d8\u05d5\u05d7 \u05e9\u05e8\u05d5\u05e6\u05d4 \u05dc\u05de\u05d7\u05d5\u05e7 \u05d0\u05ea "${name}"? \u05d6\u05d4 \u05d9\u05de\u05d7\u05e7 \u05d2\u05dd \u05d0\u05ea \u05db\u05dc \u05d4\u05ea\u05d5\u05e8\u05d9\u05dd \u05d5\u05d4\u05dc\u05e7\u05d5\u05d7\u05d5\u05ea.`)) return;
+function openEdit(b) {
+  document.getElementById('edit-id').value = b._id;
+  document.getElementById('edit-name').value = b.name || '';
+  document.getElementById('edit-phone').value = b.phone || '';
+  document.getElementById('edit-type').value = b.type || 'other';
+  document.getElementById('edit-slug').value = b.slug || '';
+  document.getElementById('edit-error').style.display = 'none';
+  showModal('edit-modal');
+}
+
+async function saveEdit() {
+  const id = document.getElementById('edit-id').value;
+  const body = {
+    name: document.getElementById('edit-name').value.trim(),
+    phone: document.getElementById('edit-phone').value.trim(),
+    type: document.getElementById('edit-type').value,
+    slug: document.getElementById('edit-slug').value.trim(),
+  };
+  try {
+    const r = await fetch(`${API}/businesses/${id}`, { method: 'PUT', headers: authHeaders(), body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok) {
+      const errEl = document.getElementById('edit-error');
+      errEl.textContent = d.error || 'שגיאה בשמירה';
+      errEl.style.display = 'block';
+      return;
+    }
+    closeModal('edit-modal');
+    toast('✅ העסק עודכן בהצלחה');
+    showDashboard();
+  } catch { toast('❌ שגיאה בשמירה'); }
+}
+
+async function toggleBusiness(id) {
+  try {
+    const r = await fetch(`${API}/businesses/${id}/toggle`, { method: 'PATCH', headers: authHeaders() });
+    const d = await r.json();
+    if (r.ok) {
+      toast(d.isActive ? '✅ העסק הופעל' : '⏸️ העסק הושבת');
+      showDashboard();
+    } else toast('❌ שגיאה');
+  } catch { toast('❌ שגיאה'); }
+}
+
+function openDelete(id, name) {
+  document.getElementById('delete-id').value = id;
+  document.getElementById('delete-name').textContent = name;
+  showModal('delete-modal');
+}
+
+async function confirmDelete() {
+  const id = document.getElementById('delete-id').value;
   try {
     const r = await fetch(`${API}/businesses/${id}`, { method: 'DELETE', headers: authHeaders() });
-    if (r.ok) showDashboard();
-    else alert('\u05e9\u05d2\u05d9\u05d0\u05d4 \u05d1\u05de\u05d7\u05d9\u05e7\u05d4');
-  } catch { alert('\u05e9\u05d2\u05d9\u05d0\u05d4 \u05d1\u05de\u05d7\u05d9\u05e7\u05d4'); }
+    if (r.ok) {
+      closeModal('delete-modal');
+      toast('🗑️ העסק נמחק');
+      showDashboard();
+    } else toast('❌ שגיאה במחיקה');
+  } catch { toast('❌ שגיאה במחיקה'); }
 }
+
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
+// Close modals on overlay click
+document.querySelectorAll('.modal-overlay').forEach(o => {
+  o.addEventListener('click', e => { if (e.target === o) o.classList.remove('show'); });
+});
 
 // Auto-login if token exists
 if (token) showDashboard();

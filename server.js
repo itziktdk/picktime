@@ -155,6 +155,8 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
     // Return all businesses so frontend can let user pick
     const allBusinesses = businesses.map(b => ({ _id: b._id, name: b.name, slug: b.slug, type: b.type }));
+    // Track last login
+    await db.collection('businesses').updateOne({ _id: business._id }, { $set: { lastLogin: new Date() } });
     res.json({ exists: true, token, business, businesses: allBusinesses });
   } catch (err) {
     console.error('Login error:', err);
@@ -1264,6 +1266,43 @@ app.get('/api/admin/data', adminAuth, async (req, res) => {
     res.json({ businesses, customers, appointments });
   } catch (err) {
     console.error('Admin data error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/admin/businesses/:id', adminAuth, async (req, res) => {
+  try {
+    const bid = req.params.id;
+    const { name, phone, type, slug } = req.body;
+    const update = {};
+    if (name !== undefined) update.name = name;
+    if (phone !== undefined) update.phone = phone;
+    if (type !== undefined) update.type = type;
+    if (slug !== undefined) {
+      const s = slug.toLowerCase().trim();
+      const existing = await db.collection('businesses').findOne({ slug: s, _id: { $ne: new ObjectId(bid) } });
+      if (existing) return res.status(400).json({ error: 'Slug already exists' });
+      update.slug = s;
+    }
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+    await db.collection('businesses').updateOne({ _id: new ObjectId(bid) }, { $set: update });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin edit business error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/api/admin/businesses/:id/toggle', adminAuth, async (req, res) => {
+  try {
+    const bid = req.params.id;
+    const business = await db.collection('businesses').findOne({ _id: new ObjectId(bid) });
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    const newState = !(business.isActive !== false);
+    await db.collection('businesses').updateOne({ _id: new ObjectId(bid) }, { $set: { isActive: newState } });
+    res.json({ success: true, isActive: newState });
+  } catch (err) {
+    console.error('Admin toggle business error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
