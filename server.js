@@ -1350,11 +1350,10 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
-// SPA fallback
+// SPA fallback — must be LAST
 app.get('*', (req, res) => {
-  if (!req.path.startsWith('/api')) {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-  }
+  if (req.path.startsWith('/api/') || req.path === '/admin' || req.path.startsWith('/book/')) return;
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 // Start
