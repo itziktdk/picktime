@@ -149,12 +149,15 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     if (!phone) return res.status(400).json({ error: 'Phone is required' });
     const businesses = await db.collection('businesses').find({ phone: sanitizeQuery(phone) }).toArray();
     if (!businesses.length) return res.json({ exists: false });
-    // If slug specified, pick that business; otherwise pick first (or let client choose)
+    const allBusinesses = businesses.map(b => ({ _id: b._id, name: b.name, slug: b.slug, type: b.type }));
+    // If multiple businesses and no slug specified, return list for selection (no token)
+    if (businesses.length > 1 && !slug) {
+      return res.json({ exists: true, businesses: allBusinesses });
+    }
+    // Single business or slug specified — pick and return token
     let business = slug ? businesses.find(b => b.slug === slug) : businesses[0];
     if (!business) business = businesses[0];
     const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
-    // Return all businesses so frontend can let user pick
-    const allBusinesses = businesses.map(b => ({ _id: b._id, name: b.name, slug: b.slug, type: b.type }));
     // Track last login
     await db.collection('businesses').updateOne({ _id: business._id }, { $set: { lastLogin: new Date() } });
     res.json({ exists: true, token, business, businesses: allBusinesses });
