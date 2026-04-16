@@ -20,5 +20,8 @@
     "mongodb": "^6.0.0"
   },
   "author": "Johnny Tzadaka",
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  }
 }

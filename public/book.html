@@ -112,12 +112,7 @@ body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--tex
       <div class="type" id="biz-type"></div>
     </div>
     
-    <div class="steps">
-      <div class="step done" data-step="1"></div>
-      <div class="step" data-step="2"></div>
-      <div class="step" data-step="3"></div>
-      <div class="step" data-step="4"></div>
-    </div>
+    <div class="steps" id="steps-bar"></div>
 
     <!-- Step 1: Service -->
     <div id="step-1" class="card">
@@ -125,8 +120,14 @@ body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--tex
       <div id="services-list"></div>
     </div>
 
+    <!-- Step Staff: Staff selection (only if business has staff) -->
+    <div id="step-staff" class="card hidden">
+      <h2><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" /></svg>בחירת איש צוות</h2>
+      <div id="staff-list"></div>
+    </div>
+
     <!-- Step 2: Date -->
-    <div id="step-2" class="card hidden">
+    <div id="step-date" class="card hidden">
       <h2><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 012.25-2.25h13.5A2.25 2.25 0 0121 7.5v11.25m-18 0A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75m-18 0v-7.5A2.25 2.25 0 015.25 9h13.5A2.25 2.25 0 0121 11.25v7.5" /></svg>בחירת תאריך</h2>
       <div class="month-nav">
         <button onclick="prevMonth()">&#8250;</button>
@@ -137,7 +138,7 @@ body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--tex
     </div>
 
     <!-- Step 3: Time -->
-    <div id="step-3" class="card hidden">
+    <div id="step-time" class="card hidden">
       <h2><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>בחירת שעה</h2>
       <div id="time-loading" class="hidden"><div class="spinner"></div></div>
       <div class="time-grid" id="time-grid"></div>
@@ -145,7 +146,7 @@ body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--tex
     </div>
 
     <!-- Step 4: Details -->
-    <div id="step-4" class="card hidden">
+    <div id="step-details" class="card hidden">
       <h2><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z" /></svg>פרטים אישיים</h2>
       <div id="booking-error" class="error-msg hidden"></div>
       <div class="form-group"><label>שם מלא</label><input type="text" id="cust-name" placeholder="ישראל ישראלי"></div>
@@ -172,9 +173,11 @@ body { font-family: 'Heebo', sans-serif; background: var(--bg); color: var(--tex
 <script>
 const API = '/api';
 const slug = location.pathname.replace(/^\/book\//, '').replace(/\/$/, '');
-let biz = null, selectedService = null, selectedDate = null, selectedTime = null;
+let biz = null, selectedService = null, selectedStaff = null, selectedDate = null, selectedTime = null;
 let currentMonth = new Date();
 let bookingToken = '';
+let hasStaff = false;
+let stepOrder = [];
 
 async function init() {
   if (!slug) { show404(); return; }
@@ -184,6 +187,9 @@ async function init() {
     biz = await r.json();
     document.getElementById('biz-name').textContent = biz.name;
     document.getElementById('biz-type').textContent = typeLabel(biz.type);
+    hasStaff = !!(biz.staffList && biz.staffList.filter(s => s.isActive !== false).length > 0);
+    stepOrder = hasStaff ? ['service','staff','date','time','details'] : ['service','date','time','details'];
+    renderStepsBar();
     renderServices();
     document.getElementById('loading').classList.add('hidden');
     document.getElementById('app').classList.remove('hidden');
@@ -221,18 +227,58 @@ function selectService(id) {
   selectedService = (biz.services || []).find(s => s._id === id);
   document.querySelectorAll('.service-item').forEach(el => el.classList.remove('selected'));
   event.currentTarget.classList.add('selected');
-  goToStep(2);
+  if (hasStaff) {
+    renderStaffList();
+    goToStepByName('staff');
+  } else {
+    goToStepByName('date');
+    renderCalendar();
+  }
+}
+
+function renderStepsBar() {
+  document.getElementById('steps-bar').innerHTML = stepOrder.map((s, i) =>
+    `<div class="step${i === 0 ? ' done' : ''}" data-idx="${i}"></div>`
+  ).join('');
+}
+
+function renderStaffList() {
+  const staff = (biz.staffList || []).filter(s => s.isActive !== false);
+  document.getElementById('staff-list').innerHTML = staff.map(s => {
+    const initials = s.name ? s.name.split(' ').map(w => w[0]).join('').slice(0,2) : '?';
+    return `<div class="service-item" onclick="selectStaffMember('${s._id || s.id}')">
+      <div style="display:flex;align-items:center;gap:12px">
+        <div style="width:40px;height:40px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:600;font-size:14px">${esc(initials)}</div>
+        <div><div class="name">${esc(s.name)}</div>${s.role ? `<div class="meta">${esc(s.role)}</div>` : ''}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function selectStaffMember(id) {
+  selectedStaff = (biz.staffList || []).find(s => (s._id || s.id) === id);
+  document.querySelectorAll('#staff-list .service-item').forEach(el => el.classList.remove('selected'));
+  event.currentTarget.classList.add('selected');
+  goToStepByName('date');
   renderCalendar();
 }
 
-function goToStep(n) {
-  for (let i = 1; i <= 4; i++) {
-    document.getElementById('step-' + i)?.classList.toggle('hidden', i > n);
-  }
-  document.querySelectorAll('.step').forEach(el => {
-    const s = parseInt(el.dataset.step);
-    el.classList.toggle('done', s < n);
-    el.classList.toggle('active', s === n);
+const stepIdMap = { service: 'step-1', staff: 'step-staff', date: 'step-date', time: 'step-time', details: 'step-details' };
+
+function goToStepByName(name) {
+  const idx = stepOrder.indexOf(name);
+  // Show/hide step cards
+  stepOrder.forEach((s, i) => {
+    const el = document.getElementById(stepIdMap[s]);
+    if (el) el.classList.toggle('hidden', i > idx);
+  });
+  // Hide confirmation
+  document.getElementById('step-done')?.classList.add('hidden');
+  // Update step bar
+  document.querySelectorAll('#steps-bar .step').forEach(el => {
+    const i = parseInt(el.dataset.idx);
+    el.classList.toggle('done', i < idx);
+    el.classList.toggle('active', i === idx);
   });
 }
 
@@ -279,13 +325,14 @@ function nextMonth() {
 async function selectDate(dateStr) {
   selectedDate = dateStr;
   renderCalendar();
-  goToStep(3);
+  goToStepByName('time');
   document.getElementById('time-loading').classList.remove('hidden');
   document.getElementById('time-grid').innerHTML = '';
   document.getElementById('no-slots').classList.add('hidden');
   
   try {
-    const r = await fetch(`${API}/businesses/${slug}/availability?date=${dateStr}&serviceId=${selectedService._id}`);
+    const staffParam = selectedStaff ? `&staffId=${selectedStaff._id || selectedStaff.id}` : '';
+    const r = await fetch(`${API}/businesses/${slug}/availability?date=${dateStr}&serviceId=${selectedService._id}${staffParam}`);
     const data = await r.json();
     document.getElementById('time-loading').classList.add('hidden');
     
@@ -312,7 +359,7 @@ async function selectDate(dateStr) {
 function selectTime(time) {
   selectedTime = time;
   document.querySelectorAll('.time-slot').forEach(el => el.classList.toggle('selected', el.textContent === time));
-  goToStep(4);
+  goToStepByName('details');
 }
 
 async function submitBooking() {
@@ -336,6 +383,7 @@ async function submitBooking() {
       body: JSON.stringify({
         bookingToken,
         serviceId: selectedService._id,
+        staffId: selectedStaff ? (selectedStaff._id || selectedStaff.id) : undefined,
         customerName: name,
         customerPhone: phone,
         date: selectedDate,
@@ -353,13 +401,14 @@ async function submitBooking() {
     }
     
     // Show confirmation
-    for (let i = 1; i <= 4; i++) document.getElementById('step-' + i)?.classList.add('hidden');
-    document.querySelectorAll('.step').forEach(el => el.classList.add('done'));
+    stepOrder.forEach(s => document.getElementById(stepIdMap[s])?.classList.add('hidden'));
+    document.querySelectorAll('#steps-bar .step').forEach(el => el.classList.add('done'));
     document.getElementById('step-done').classList.remove('hidden');
     
     const dateFormatted = new Date(selectedDate + 'T00:00:00').toLocaleDateString('he-IL', { weekday: 'long', day: 'numeric', month: 'long' });
     document.getElementById('booking-summary').innerHTML = `
       <div><strong>שירות:</strong> ${esc(selectedService.name)}</div>
+      ${selectedStaff ? `<div><strong>איש צוות:</strong> ${esc(selectedStaff.name)}</div>` : ''}
       <div><strong>תאריך:</strong> ${dateFormatted}</div>
       <div><strong>שעה:</strong> ${selectedTime}</div>
       <div><strong>שם:</strong> ${esc(name)}</div>
