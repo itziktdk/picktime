@@ -1157,6 +1157,46 @@ app.get('/api/businesses/:slug/stats', authMiddleware, async (req, res) => {
   }
 });
 
+// Extended stats with monthly data and busiest day
+app.get('/api/businesses/:slug/stats/extended', authMiddleware, async (req, res) => {
+  try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+    const bid = business._id;
+    const bidStr = business._id.toString();
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+    const weekAgoStr = new Date(now - 7 * 86400000).toISOString().split('T')[0];
+
+    const monthAppts = await db.collection('appointments').find({
+      businessId: { $in: [bid, bidStr] }, date: { $gte: monthStart }, status: { $ne: 'cancelled' }
+    }).toArray();
+
+    let monthRevenue = 0;
+    const dayCount = [0, 0, 0, 0, 0, 0, 0]; // Sun-Sat
+    for (const a of monthAppts) {
+      const svc = business.services?.find(s => s._id?.toString() === a.serviceId || s.name === a.serviceName);
+      if (svc && a.status === 'confirmed') monthRevenue += svc.price || 0;
+      const d = new Date(a.date + 'T00:00:00');
+      if (!isNaN(d.getTime())) dayCount[d.getDay()]++;
+    }
+
+    const monthCustomers = await db.collection('customers').countDocuments({
+      businessId: { $in: [bid, bidStr] }, createdAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
+    });
+
+    res.json({
+      monthAppointments: monthAppts.length,
+      monthRevenue,
+      monthNewCustomers: monthCustomers,
+      busiestDayData: dayCount, // [Sun, Mon, Tue, Wed, Thu, Fri, Sat]
+    });
+  } catch (err) {
+    console.error('Extended stats error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ============ REMINDERS API ============
 
 // Check for pending reminders (called by cron from Johnny's VM)
