@@ -27,7 +27,7 @@ test.describe('Public Booking Page', () => {
     await page.goto(`${BASE}/book/narkis11`);
     await expect(page.locator('#biz-name')).toHaveText('נרקיס', { timeout: 10000 });
     await page.locator('.service-item').first().click();
-    await expect(page.locator('#step-2')).toBeVisible();
+    await expect(page.locator('#step-date')).toBeVisible();
     await expect(page.locator('#month-label')).toBeVisible();
   });
 });
