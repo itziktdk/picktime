@@ -8,9 +8,14 @@ const path = require('path');
 const crypto = require('crypto');
 
 const jwt = require('jsonwebtoken');
+const { Expo } = require('expo-server-sdk');
 const JWT_SECRET = process.env.JWT_SECRET || 'snaptor-secret-key-change-in-production';
 
 const app = express();
+
+// Azure App Service / ARR terminates TLS and forwards X-Forwarded-For.
+// '1' = trust the first proxy hop. Required for correct per-client rate limits.
+app.set('trust proxy', 1);
 
 // ============ SECURITY HELPERS ============
 
@@ -90,26 +95,58 @@ function sanitizeBody(req, res, next) {
 
 // ============ RATE LIMITERS ============
 
-const globalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
+// Authenticated API requests: key by businessId from JWT when present, else IP.
+// Avoids carrier-NAT / shared-WiFi buckets locking out mobile WebView users.
+function rateLimitKey(req) {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer ')) {
+    try {
+      const decoded = jwt.verify(auth.slice(7), JWT_SECRET);
+      if (decoded && decoded.businessId) return 'biz:' + decoded.businessId;
+    } catch { /* fall through to IP */ }
+  }
+  return 'ip:' + req.ip;
+}
+
+// Higher ceiling; skips static assets and health checks.
+// validate:false — custom keyGenerator mixes biz: and ip: prefixes (not bare IPv6).
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 600, // ~40 req/min sustained — fine for a dashboard SPA
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: rateLimitKey,
+  validate: false,
+  skip: (req) => {
+    if (!req.path.startsWith('/api/')) return true;
+    if (req.path === '/api/health') return true;
+    return false;
+  },
+  message: { error: 'Too many requests. Please try again shortly.' },
+});
 
 const bookingLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
-  max: 5,
+  max: 10,
   message: { error: 'Too many bookings. Try again later.' },
-  keyGenerator: (req) => req.ip
+  validate: false,
+  keyGenerator: (req) => 'ip:' + req.ip,
 });
 
 const createBusinessLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000, // 24 hours
   max: 3,
   message: { error: 'Too many businesses created. Try again tomorrow.' },
-  keyGenerator: (req) => req.ip
+  validate: false,
+  keyGenerator: (req) => 'ip:' + req.ip,
 });
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { error: 'Too many login attempts. Try again later.' }
+  max: 20,
+  message: { error: 'Too many login attempts. Try again later.' },
+  validate: false,
+  keyGenerator: (req) => 'ip:' + req.ip,
 });
 
 // ============ MIDDLEWARE ============
@@ -117,9 +154,13 @@ const loginLimiter = rateLimit({
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
-app.use(globalLimiter);
 app.use(sanitizeBody);
-app.use(express.static('public'));
+
+// Static files FIRST — never touch the API rate limiter
+app.use(express.static('public', { maxAge: '1h', index: false }));
+
+// API rate limiter (skips non-/api and /api/health via skip())
+app.use(apiLimiter);
 
 // MongoDB connection
 let db;
@@ -133,12 +174,109 @@ async function connectDB() {
   await db.collection('customers').createIndex({ businessId: 1, phone: 1 });
   await db.collection('customers').createIndex({ businessId: 1, lastVisit: -1 });
   await db.collection('tasks').createIndex({ businessId: 1, completed: 1 });
+  await db.collection('push_tokens').createIndex({ token: 1 }, { unique: true });
+  await db.collection('push_tokens').createIndex({ business_id: 1 });
+  await db.collection('push_tokens').createIndex({ last_seen_at: 1 });
   console.log('Connected to MongoDB');
 }
 
 // Helper: get business by slug
 async function getBusinessBySlug(slug) {
   return db.collection('businesses').findOne({ slug: sanitizeQuery(slug) });
+}
+
+// ============ PUSH NOTIFICATIONS ============
+
+const expo = new Expo({
+  accessToken: process.env.EXPO_ACCESS_TOKEN || undefined,
+});
+
+const PUSH_COPY = {
+  he: {
+    new_booking_title: 'תור חדש',
+    new_booking_body: ({ customerName, serviceName, date, time }) =>
+      `${customerName} הזמין/ה ${serviceName} ב-${date} ${time}`,
+    cancelled_title: 'תור בוטל',
+    cancelled_body: ({ customerName, serviceName, date, time }) =>
+      `${customerName} — ${serviceName} ב-${date} ${time} בוטל`,
+    reminder_title: 'תזכורת לתור',
+    reminder_body: ({ customerName, serviceName, date, time }) =>
+      `${customerName} — ${serviceName} ב-${date} ${time}`,
+  },
+  en: {
+    new_booking_title: 'New booking',
+    new_booking_body: ({ customerName, serviceName, date, time }) =>
+      `${customerName} booked ${serviceName} on ${date} at ${time}`,
+    cancelled_title: 'Booking cancelled',
+    cancelled_body: ({ customerName, serviceName, date, time }) =>
+      `${customerName} — ${serviceName} on ${date} at ${time} was cancelled`,
+    reminder_title: 'Appointment reminder',
+    reminder_body: ({ customerName, serviceName, date, time }) =>
+      `${customerName} — ${serviceName} on ${date} at ${time}`,
+  },
+};
+
+async function notifyBusiness(businessId, { titleKey, bodyKey, payload, url }) {
+  if (!db || !businessId) return;
+  const tokens = await db.collection('push_tokens')
+    .find({ business_id: businessId.toString() })
+    .toArray();
+  if (!tokens.length) return;
+
+  const messages = [];
+  for (const t of tokens) {
+    if (!Expo.isExpoPushToken(t.token)) continue;
+    const copy = PUSH_COPY[t.locale === 'en' ? 'en' : 'he'];
+    messages.push({
+      to: t.token,
+      sound: 'default',
+      title: copy[titleKey],
+      body: copy[bodyKey](payload),
+      data: { url: url || '/(dashboard)/appointments' },
+      channelId: 'default',
+    });
+  }
+  if (!messages.length) return;
+
+  const tickets = [];
+  for (const chunk of expo.chunkPushNotifications(messages)) {
+    try {
+      const ticketChunk = await expo.sendPushNotificationsAsync(chunk);
+      tickets.push(...ticketChunk.map((ticket, i) => ({ ticket, token: chunk[i].to })));
+    } catch (err) {
+      console.error('expo push send error', err);
+    }
+  }
+
+  // Receipts cleanup (~15 min later). Fire-and-forget.
+  setTimeout(() => { void cleanupPushReceipts(tickets); }, 15 * 60 * 1000);
+}
+
+async function cleanupPushReceipts(tickets) {
+  if (!db || !tickets || !tickets.length) return;
+  const ids = {};
+  for (const { ticket, token } of tickets) {
+    if (ticket && ticket.status === 'ok' && ticket.id) ids[ticket.id] = token;
+    if (ticket && ticket.status === 'error' && ticket.details && ticket.details.error === 'DeviceNotRegistered') {
+      await db.collection('push_tokens').deleteOne({ token });
+    }
+  }
+  const receiptIds = Object.keys(ids);
+  if (!receiptIds.length) return;
+  const receiptIdChunks = expo.chunkPushNotificationReceiptIds(receiptIds);
+  for (const chunk of receiptIdChunks) {
+    try {
+      const receipts = await expo.getPushNotificationReceiptsAsync(chunk);
+      for (const [id, receipt] of Object.entries(receipts)) {
+        if (receipt.status === 'error' && receipt.details && receipt.details.error === 'DeviceNotRegistered') {
+          const expoToken = (receipt.details && receipt.details.expoPushToken) || ids[id];
+          if (expoToken) await db.collection('push_tokens').deleteOne({ token: expoToken });
+        }
+      }
+    } catch (err) {
+      console.error('expo receipts error', err);
+    }
+  }
 }
 
 // ============ AUTH ============
@@ -175,6 +313,82 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     res.json(business);
   } catch (err) {
     console.error('Auth me error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============ PUSH TOKENS ============
+
+app.post('/api/push-tokens', authMiddleware, async (req, res) => {
+  try {
+    const { token, platform, appVersion, locale } = req.body || {};
+    if (!token || !Expo.isExpoPushToken(token)) {
+      return res.status(400).json({ error: 'Invalid Expo push token' });
+    }
+    const plat = platform === 'android' ? 'android' : 'ios';
+    const now = new Date();
+    await db.collection('push_tokens').updateOne(
+      { token },
+      {
+        $set: {
+          token,
+          business_id: req.businessId,
+          platform: plat,
+          app_version: appVersion || null,
+          locale: locale === 'en' ? 'en' : 'he',
+          last_seen_at: now,
+        },
+        $setOnInsert: { created_at: now },
+      },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('push-tokens POST', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/push-tokens', authMiddleware, async (req, res) => {
+  try {
+    const token = (req.body && req.body.token) || req.query.token;
+    if (!token) return res.status(400).json({ error: 'token required' });
+    await db.collection('push_tokens').deleteOne({
+      token,
+      business_id: req.businessId,
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('push-tokens DELETE', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Account deletion (App Store 5.1.1(v)) — requires Bearer auth + confirmSlug match
+app.delete('/api/account', authMiddleware, async (req, res) => {
+  try {
+    const confirmSlug = ((req.body && req.body.confirmSlug) || '').toLowerCase().trim();
+    const business = await db.collection('businesses').findOne({ _id: new ObjectId(req.businessId) });
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!confirmSlug || confirmSlug !== business.slug) {
+      return res.status(400).json({ error: 'confirmSlug does not match' });
+    }
+
+    const bid = business._id;
+    const bidStr = bid.toString();
+
+    await Promise.all([
+      db.collection('appointments').deleteMany({ businessId: { $in: [bid, bidStr] } }),
+      db.collection('customers').deleteMany({ businessId: { $in: [bid, bidStr] } }),
+      db.collection('tasks').deleteMany({ businessId: { $in: [bid, bidStr] } }),
+      db.collection('announcements').deleteMany({ businessId: { $in: [bid, bidStr] } }),
+      db.collection('push_tokens').deleteMany({ business_id: bidStr }),
+      db.collection('businesses').deleteOne({ _id: bid }),
+    ]);
+
+    res.json({ success: true, deleted: business.slug });
+  } catch (err) {
+    console.error('Account delete error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -547,6 +761,19 @@ app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) 
       });
     }
 
+    // Push notify owner devices (non-blocking)
+    void notifyBusiness(business._id, {
+      titleKey: 'new_booking_title',
+      bodyKey: 'new_booking_body',
+      payload: {
+        customerName: appointment.customerName,
+        serviceName: appointment.serviceName,
+        date: appointment.date,
+        time: appointment.startTime,
+      },
+      url: '/(dashboard)/appointments',
+    });
+
     res.status(201).json(appointment);
   } catch (err) {
     console.error('Book appointment error:', err.message);
@@ -573,6 +800,21 @@ app.put('/api/businesses/:slug/appointments/:id', authMiddleware, async (req, re
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Appointment not found' });
+
+    if (status === 'cancelled') {
+      void notifyBusiness(business._id, {
+        titleKey: 'cancelled_title',
+        bodyKey: 'cancelled_body',
+        payload: {
+          customerName: result.customerName,
+          serviceName: result.serviceName,
+          date: result.date,
+          time: result.startTime,
+        },
+        url: '/(dashboard)/appointments',
+      });
+    }
+
     res.json(result);
   } catch (err) {
     console.error('Update appointment error:', err);
@@ -596,6 +838,19 @@ app.delete('/api/businesses/:slug/appointments/:id', authMiddleware, async (req,
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Appointment not found' });
+
+    void notifyBusiness(business._id, {
+      titleKey: 'cancelled_title',
+      bodyKey: 'cancelled_body',
+      payload: {
+        customerName: result.customerName,
+        serviceName: result.serviceName,
+        date: result.date,
+        time: result.startTime,
+      },
+      url: '/(dashboard)/appointments',
+    });
+
     res.json({ success: true, appointment: result });
   } catch (err) {
     console.error('Cancel appointment error:', err);
@@ -1199,14 +1454,18 @@ app.get('/api/businesses/:slug/stats/extended', authMiddleware, async (req, res)
 
 // ============ REMINDERS API ============
 
-// Check for pending reminders (called by cron from Johnny's VM)
+// Check for pending reminders (called by cron from Johnny's VM).
+// WhatsApp reminders use reminderSettings + reminders.* flags.
+// Push reminders for 24h + 1h always fire (independent pushReminders.* flags).
 app.post('/api/reminders/check', async (req, res) => {
   try {
     const REMINDER_INTERVALS = [
-      { minutes: 1440, key: '1day' },
-      { minutes: 120, key: '2hours' },
-      { minutes: 30, key: '30min' },
+      { minutes: 1440, key: '1day' },   // 24h
+      { minutes: 60,   key: '1hour' },  // 1h — push (WhatsApp only if enabled in settings)
+      { minutes: 120,  key: '2hours' },
+      { minutes: 30,   key: '30min' },
     ];
+    const PUSH_REMINDER_KEYS = new Set(['1day', '1hour']);
 
     const businesses = await db.collection('businesses').find({ isActive: { $ne: false } }).toArray();
     const remindersToSend = [];
@@ -1215,37 +1474,62 @@ app.post('/api/reminders/check', async (req, res) => {
       const settings = biz.reminderSettings || { '1day': true, '2hours': true, '30min': false };
 
       for (const interval of REMINDER_INTERVALS) {
-        if (!settings[interval.key]) continue;
+        const wantsWhatsApp = !!settings[interval.key];
+        const wantsPush = PUSH_REMINDER_KEYS.has(interval.key);
+        if (!wantsWhatsApp && !wantsPush) continue;
 
         const targetTime = new Date(Date.now() + interval.minutes * 60000);
         const targetDate = targetTime.toISOString().split('T')[0];
         const targetHour = targetTime.toTimeString().slice(0, 5);
 
+        // Match both string and ObjectId businessId (historical inconsistency)
         const appointments = await db.collection('appointments').find({
-          businessId: biz._id.toString(),
+          businessId: { $in: [biz._id.toString(), biz._id] },
           date: targetDate,
           startTime: targetHour,
           status: { $in: ['confirmed', 'pending'] },
-          [`reminders.${interval.key}`]: { $ne: true },
         }).toArray();
 
         for (const appt of appointments) {
-          const template = settings.template || 'שלום {customer_name}, תזכורת: יש לך תור ל{service} ב{date} בשעה {time} ב{business_name}. לאישור השב 1, לביטול השב 2.';
-          const message = template
-            .replace(/{customer_name}/g, appt.customerName || '')
-            .replace(/{service}/g, appt.serviceName || '')
-            .replace(/{date}/g, appt.date || '')
-            .replace(/{time}/g, appt.startTime || '')
-            .replace(/{business_name}/g, biz.name || '');
+          const alreadyWa = appt.reminders && appt.reminders[interval.key] === true;
+          const alreadyPush = appt.pushReminders && appt.pushReminders[interval.key] === true;
 
-          remindersToSend.push({
-            appointmentId: appt._id.toString(),
-            businessId: biz._id.toString(),
-            customerPhone: appt.customerPhone,
-            customerName: appt.customerName,
-            message,
-            intervalKey: interval.key,
-          });
+          if (wantsWhatsApp && !alreadyWa) {
+            const template = settings.template || 'שלום {customer_name}, תזכורת: יש לך תור ל{service} ב{date} בשעה {time} ב{business_name}. לאישור השב 1, לביטול השב 2.';
+            const message = template
+              .replace(/{customer_name}/g, appt.customerName || '')
+              .replace(/{service}/g, appt.serviceName || '')
+              .replace(/{date}/g, appt.date || '')
+              .replace(/{time}/g, appt.startTime || '')
+              .replace(/{business_name}/g, biz.name || '');
+
+            remindersToSend.push({
+              appointmentId: appt._id.toString(),
+              businessId: biz._id.toString(),
+              customerPhone: appt.customerPhone,
+              customerName: appt.customerName,
+              message,
+              intervalKey: interval.key,
+            });
+          }
+
+          if (wantsPush && !alreadyPush) {
+            void notifyBusiness(biz._id, {
+              titleKey: 'reminder_title',
+              bodyKey: 'reminder_body',
+              payload: {
+                customerName: appt.customerName,
+                serviceName: appt.serviceName,
+                date: appt.date,
+                time: appt.startTime,
+              },
+              url: '/(dashboard)/appointments',
+            });
+            await db.collection('appointments').updateOne(
+              { _id: appt._id },
+              { $set: { [`pushReminders.${interval.key}`]: true } }
+            );
+          }
         }
       }
     }
