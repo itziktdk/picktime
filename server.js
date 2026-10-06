@@ -1454,6 +1454,37 @@ app.get('/api/businesses/:slug/stats/extended', authMiddleware, async (req, res)
 
 // ============ REMINDERS API ============
 
+const reminderService = require('./reminder-service.js');
+
+// Start reminder loop if Twilio is configured (checks every 2 minutes)
+if (process.env.TWILIO_ACCOUNT_SID) {
+  reminderService.startReminderLoop(120000, `http://localhost:${process.env.PORT || 3000}`);
+}
+
+// Manually trigger reminder processing
+app.post('/api/reminders/process', async (req, res) => {
+  try {
+    const result = await reminderService.processReminders(`http://localhost:${process.env.PORT || 3000}`);
+    res.json(result);
+  } catch (err) {
+    console.error('Reminders process error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Send a single reminder (for testing or manual sends)
+app.post('/api/reminders/send', async (req, res) => {
+  try {
+    const { phone, message, channel } = req.body;
+    if (!phone || !message) return res.status(400).json({ error: 'Missing phone or message' });
+    const result = await reminderService.sendReminder(phone, message, channel);
+    res.json(result);
+  } catch (err) {
+    console.error('Reminder send error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Check for pending reminders (called by cron from Johnny's VM).
 // WhatsApp reminders use reminderSettings + reminders.* flags.
 // Push reminders for 24h + 1h always fire (independent pushReminders.* flags).
@@ -1554,6 +1585,34 @@ app.post('/api/reminders/mark-sent', async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error('Mark reminder error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get reminder history for a business
+app.get('/api/businesses/:slug/reminders', authMiddleware, async (req, res) => {
+  try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Forbidden' });
+
+    const appointments = await db.collection('appointments').find({
+      businessId: business._id.toString(),
+      'reminders': { $exists: true },
+    }).sort({ date: -1 }).limit(50).toArray();
+
+    const history = appointments.map(a => ({
+      appointmentId: a._id.toString(),
+      customerName: a.customerName,
+      customerPhone: a.customerPhone,
+      date: a.date,
+      startTime: a.startTime,
+      reminders: a.reminders || {},
+    }));
+
+    res.json(history);
+  } catch (err) {
+    console.error('Reminder history error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
