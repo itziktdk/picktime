@@ -95,6 +95,18 @@ function sanitizeBody(req, res, next) {
 
 // ============ RATE LIMITERS ============
 
+// Client IP without the source port. Azure App Service forwards
+// X-Forwarded-For as "ip:port" (IPv4) or "[ipv6]:port", so with trust proxy
+// req.ip would differ per TCP connection and per-IP limits would never trip.
+function clientIp(req) {
+  const raw = String(req.ip || (req.socket && req.socket.remoteAddress) || '').trim();
+  let m = raw.match(/^\[([0-9a-fA-F:.]+)\](?::\d+)?$/);   // [ipv6]:port
+  if (m) return m[1];
+  m = raw.match(/^(?:::ffff:)?(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?$/); // ipv4[:port]
+  if (m) return m[1];
+  return raw; // bare IPv6 or unknown
+}
+
 // Authenticated API requests: key by businessId from JWT when present, else IP.
 // Avoids carrier-NAT / shared-WiFi buckets locking out mobile WebView users.
 function rateLimitKey(req) {
@@ -105,7 +117,7 @@ function rateLimitKey(req) {
       if (decoded && decoded.businessId) return 'biz:' + decoded.businessId;
     } catch { /* fall through to IP */ }
   }
-  return 'ip:' + req.ip;
+  return 'ip:' + clientIp(req);
 }
 
 // Higher ceiling; skips static assets and health checks.
@@ -130,7 +142,7 @@ const bookingLimiter = rateLimit({
   max: 10,
   message: { error: 'Too many bookings. Try again later.' },
   validate: false,
-  keyGenerator: (req) => 'ip:' + req.ip,
+  keyGenerator: (req) => 'ip:' + clientIp(req),
 });
 
 const createBusinessLimiter = rateLimit({
@@ -138,7 +150,7 @@ const createBusinessLimiter = rateLimit({
   max: 3,
   message: { error: 'Too many businesses created. Try again tomorrow.' },
   validate: false,
-  keyGenerator: (req) => 'ip:' + req.ip,
+  keyGenerator: (req) => 'ip:' + clientIp(req),
 });
 
 const loginLimiter = rateLimit({
@@ -146,7 +158,7 @@ const loginLimiter = rateLimit({
   max: 20,
   message: { error: 'Too many login attempts. Try again later.' },
   validate: false,
-  keyGenerator: (req) => 'ip:' + req.ip,
+  keyGenerator: (req) => 'ip:' + clientIp(req),
 });
 
 // ============ MIDDLEWARE ============
