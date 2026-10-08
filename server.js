@@ -9,7 +9,31 @@ const crypto = require('crypto');
 
 const jwt = require('jsonwebtoken');
 const { Expo } = require('expo-server-sdk');
-const JWT_SECRET = process.env.JWT_SECRET || 'snaptor-secret-key-change-in-production';
+const T = require('./lib/time');
+const mongoLimit = require('./lib/mongo-rate-limit');
+const otp = require('./lib/otp');
+const { createSender } = require('./lib/otp-sender');
+const reminders = require('./lib/reminders');
+const reminderService = require('./reminder-service.js');
+
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+// ============ SECRETS / CONFIG ============
+// Never fall back to a well-known secret in production: anyone could forge owner tokens.
+if (!process.env.JWT_SECRET && IS_PROD) {
+  console.error('FATAL: JWT_SECRET is not set. Refusing to start in production.');
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-insecure-jwt-secret';
+const OTP_SECRET = process.env.OTP_SECRET || JWT_SECRET;
+const TOKEN_TTL = process.env.TOKEN_TTL || '7d';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (IS_PROD ? '' : 'dev-admin-password');
+const ADMIN_JWT_SECRET = JWT_SECRET + '-admin';
+const intEnv = (name, def) => { const n = parseInt(process.env[name], 10); return Number.isFinite(n) && n > 0 ? n : def; };
+
+let otpSender = createSender(process.env);
+function otpFlagOn() { return String(process.env.AUTH_OTP_REQUIRED || '').toLowerCase() === 'true'; }
+function otpEnabled() { return otpFlagOn() && !!otpSender.configured; }
 
 const app = express();
 
@@ -52,43 +76,163 @@ function isValidIsraeliPhone(phone) {
   return /^(\+972|972|0)(5[0-9]|7[0-9])\d{7}$/.test(cleaned);
 }
 
-// Booking tokens (anti-spam)
-const bookingTokens = new Map();
-
-function cleanExpiredTokens() {
-  const now = Date.now();
-  for (const [k, v] of bookingTokens) {
-    if (now - v.createdAt > 600000) bookingTokens.delete(k);
-  }
+/** Canonical local form "05XXXXXXXX" for Israeli numbers, else digits-only. */
+function phoneKey(phone) {
+  let p = String(phone || '').replace(/[\s\-()]/g, '');
+  if (p.startsWith('+972')) p = '0' + p.slice(4);
+  else if (p.startsWith('972')) p = '0' + p.slice(3);
+  return p.replace(/[^\d+]/g, '');
 }
 
-// Auth middleware
-function authMiddleware(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
+/** All stored formats that may represent the same phone (backward compatible lookup). */
+function phoneVariants(phone) {
+  const raw = sanitizeQuery(String(phone || '')).trim();
+  const key = phoneKey(raw);
+  const set = new Set([raw, key]);
+  if (/^0\d{9}$/.test(key)) {
+    set.add(`${key.slice(0, 3)}-${key.slice(3)}`);
+    set.add(`${key.slice(0, 3)}-${key.slice(3, 6)}-${key.slice(6)}`);
+    set.add('+972' + key.slice(1));
+    set.add('972' + key.slice(1));
+  }
+  return [...set].filter(Boolean);
+}
+
+function maskPhone(phone) {
+  const p = phoneKey(phone);
+  return p.length > 5 ? `${p.slice(0, 3)}***${p.slice(-2)}` : '***';
+}
+
+const isStr = (v) => typeof v === 'string';
+const isNonEmptyStr = (v) => typeof v === 'string' && v.trim().length > 0;
+
+// ============ IDS / TENANT SCOPING ============
+
+function toObjectId(id) {
+  if (id instanceof ObjectId) return id;
+  if (typeof id !== 'string' || !/^[a-fA-F0-9]{24}$/.test(id)) return null;
+  return new ObjectId(id);
+}
+
+/** businessId is stored as ObjectId in some collections and as string in others. */
+function bizIdFilter(business) {
+  return { $in: [business._id, business._id.toString()] };
+}
+
+/** Filter for a child document that must belong to the business. */
+function ownedFilter(business, id) {
+  return { _id: id instanceof ObjectId ? id : toObjectId(id), businessId: bizIdFilter(business) };
+}
+
+/** Add a string `id` (= _id) to embedded services/staff so clients have one stable key. */
+function withId(item) {
+  if (!item || typeof item !== 'object') return item;
+  if (item._id) return { ...item, id: item._id.toString() };
+  return item;
+}
+
+function normalizeBusiness(business) {
+  if (!business) return business;
+  return {
+    ...business,
+    id: business._id ? business._id.toString() : business.id,
+    timezone: T.businessTz(business),
+    services: (business.services || []).map(withId),
+    staff: (business.staff || []).map(withId),
+  };
+}
+
+function publicService(s) {
+  const id = s._id ? s._id.toString() : (s.id != null ? String(s.id) : undefined);
+  return { _id: s._id || id, id, name: s.name, duration: s.duration, price: s.price };
+}
+
+function publicStaff(s) {
+  return { _id: s._id, id: s._id ? s._id.toString() : undefined, name: s.name, role: s.role, services: (s.services || []).map(String), workingHours: s.workingHours || {} };
+}
+
+/** Find a service by its _id string. Legacy services without _id can match their old `id`. */
+function findService(business, serviceId) {
+  if (!isNonEmptyStr(serviceId)) return null;
+  const services = business.services || [];
+  return services.find(s => s && s._id && s._id.toString() === serviceId)
+    || services.find(s => s && !s._id && s.id != null && String(s.id) === serviceId)
+    || null;
+}
+
+function serviceKey(service) {
+  return service._id ? service._id.toString() : String(service.id);
+}
+
+// ============ AUTH HELPERS ============
+
+function signOwnerToken(business) {
+  return jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+}
+
+function logAuth(event, req, extra = {}) {
+  const parts = Object.entries(extra).map(([k, v]) => `${k}=${v}`).join(' ');
+  console.log(`[auth] ${event} ip=${clientIp(req)} ${parts}`.trim());
+}
+
+// Auth middleware — verifies the JWT and that the business still exists
+// (a deleted account's tokens stop working immediately).
+async function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : header.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token' });
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.businessId = decoded.businessId;
-    req.businessSlug = decoded.slug;
-    next();
-  } catch { return res.status(401).json({ error: 'Invalid token' }); }
-}
-
-// Ownership verification: ensure authenticated user owns the business slug
-async function verifyOwnership(req, res, next) {
-  const business = await getBusinessBySlug(req.params.slug);
-  if (!business) return res.status(404).json({ error: 'Business not found' });
-  if (business._id.toString() !== req.businessId) {
-    return res.status(403).json({ error: 'Not authorized for this business' });
+    decoded = jwt.verify(token, JWT_SECRET);
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
   }
-  req.business = business;
+  const oid = toObjectId(decoded && decoded.businessId);
+  if (!oid) return res.status(401).json({ error: 'Invalid token' });
+  try {
+    const exists = await db.collection('businesses').findOne({ _id: oid }, { projection: { _id: 1 } });
+    if (!exists) return res.status(401).json({ error: 'Session expired' });
+  } catch (err) {
+    return next(err);
+  }
+  req.businessId = decoded.businessId;
+  req.businessSlug = decoded.slug;
   next();
 }
+
+// Ownership verification: the authenticated user must own :slug.
+// 404 when the business doesn't exist, 403 when it belongs to someone else.
+async function verifyOwnership(req, res, next) {
+  try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (business._id.toString() !== req.businessId) {
+      return res.status(403).json({ error: 'Not authorized for this business' });
+    }
+    req.business = business;
+    next();
+  } catch (err) { next(err); }
+}
+
+const requireOwner = [authMiddleware, verifyOwnership];
 
 // Sanitize all POST/PUT bodies
 function sanitizeBody(req, res, next) {
   if (req.body && typeof req.body === 'object') {
     req.body = sanitizeObject(req.body);
+  }
+  next();
+}
+
+// Shared-secret guard for scheduler endpoints (/api/reminders/*).
+function sha256(s) { return crypto.createHash('sha256').update(String(s)).digest(); }
+function requireCronSecret(req, res, next) {
+  const expected = process.env.REMINDER_CRON_SECRET;
+  if (!expected) return res.status(503).json({ error: 'Reminder endpoints are disabled (REMINDER_CRON_SECRET not set)' });
+  const got = req.get('x-cron-secret') || '';
+  if (!got || !crypto.timingSafeEqual(sha256(got), sha256(expected))) {
+    console.warn(`[reminders] rejected unauthenticated ${req.method} ${req.path} ip=${clientIp(req)}`);
+    return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
 }
@@ -124,7 +268,7 @@ function rateLimitKey(req) {
 // validate:false — custom keyGenerator mixes biz: and ip: prefixes (not bare IPv6).
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 600, // ~40 req/min sustained — fine for a dashboard SPA
+  max: intEnv('API_RATE_LIMIT', 600), // ~40 req/min sustained — fine for a dashboard SPA
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: rateLimitKey,
@@ -139,7 +283,7 @@ const apiLimiter = rateLimit({
 
 const bookingLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
-  max: 10,
+  max: intEnv('BOOKING_RATE_LIMIT', 10),
   message: { error: 'Too many bookings. Try again later.' },
   validate: false,
   keyGenerator: (req) => 'ip:' + clientIp(req),
@@ -147,7 +291,7 @@ const bookingLimiter = rateLimit({
 
 const createBusinessLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000, // 24 hours
-  max: 3,
+  max: intEnv('CREATE_BUSINESS_RATE_LIMIT', 3),
   message: { error: 'Too many businesses created. Try again tomorrow.' },
   validate: false,
   keyGenerator: (req) => 'ip:' + clientIp(req),
@@ -155,11 +299,27 @@ const createBusinessLimiter = rateLimit({
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: intEnv('LOGIN_RATE_LIMIT', 20),
   message: { error: 'Too many login attempts. Try again later.' },
   validate: false,
   keyGenerator: (req) => 'ip:' + clientIp(req),
 });
+
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: intEnv('ADMIN_LOGIN_RATE_LIMIT', 10),
+  message: { error: 'Too many attempts. Try again later.' },
+  validate: false,
+  keyGenerator: (req) => 'ip:' + clientIp(req),
+});
+
+// Per-phone limits (MongoDB-backed so they survive restarts)
+const PHONE_LOGIN_LIMIT = { max: intEnv('PHONE_LOGIN_LIMIT', 10), windowMs: 15 * 60 * 1000 };
+const OTP_SEND_LIMITS = [
+  { scope: 'phone', max: intEnv('OTP_SEND_PER_PHONE_15M', 3), windowMs: 15 * 60 * 1000 },
+  { scope: 'phone', max: intEnv('OTP_SEND_PER_PHONE_DAY', 10), windowMs: 24 * 60 * 60 * 1000 },
+  { scope: 'ip', max: intEnv('OTP_SEND_PER_IP_HOUR', 10), windowMs: 60 * 60 * 1000 },
+];
 
 // ============ MIDDLEWARE ============
 
@@ -169,31 +329,45 @@ app.use(express.json());
 app.use(sanitizeBody);
 
 // Static files FIRST — never touch the API rate limiter
-app.use(express.static('public', { maxAge: '1h', index: false }));
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h', index: false }));
 
 // API rate limiter (skips non-/api and /api/health via skip())
 app.use(apiLimiter);
 
+// Malformed ObjectIds in the URL → 400 instead of a 500 from new ObjectId()
+function validateObjectIdParam(req, res, next, value) {
+  if (!toObjectId(value)) return res.status(400).json({ error: 'Invalid id' });
+  next();
+}
+app.param('id', validateObjectIdParam);
+app.param('requestId', validateObjectIdParam);
+
 // MongoDB connection
 let db;
-const client = new MongoClient(process.env.MONGODB_URI);
+const client = new MongoClient(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017');
 
 async function connectDB() {
   await client.connect();
-  db = client.db('picktime');
+  db = client.db(process.env.MONGODB_DB || 'picktime');
   await db.collection('businesses').createIndex({ slug: 1 }, { unique: true });
   await db.collection('appointments').createIndex({ businessId: 1, date: 1 });
+  await db.collection('appointments').createIndex({ date: 1, status: 1 });
   await db.collection('customers').createIndex({ businessId: 1, phone: 1 });
   await db.collection('customers').createIndex({ businessId: 1, lastVisit: -1 });
   await db.collection('tasks').createIndex({ businessId: 1, completed: 1 });
   await db.collection('push_tokens').createIndex({ token: 1 }, { unique: true });
   await db.collection('push_tokens').createIndex({ business_id: 1 });
   await db.collection('push_tokens').createIndex({ last_seen_at: 1 });
+  await db.collection('booking_tokens').createIndex({ createdAt: 1 }, { expireAfterSeconds: 15 * 60 });
+  await mongoLimit.ensureIndexes(db);
+  await otp.ensureIndexes(db);
   console.log('Connected to MongoDB');
+  return db;
 }
 
 // Helper: get business by slug
 async function getBusinessBySlug(slug) {
+  if (typeof slug !== 'string') return null;
   return db.collection('businesses').findOne({ slug: sanitizeQuery(slug) });
 }
 
@@ -292,27 +466,150 @@ async function cleanupPushReceipts(tickets) {
 }
 
 // ============ AUTH ============
+//
+// Two modes:
+//  * Legacy (default, AUTH_OTP_REQUIRED unset/false or no OTP provider configured):
+//    phone-only login, hardened with per-IP + per-phone rate limits, 7-day tokens and audit logs.
+//  * OTP (AUTH_OTP_REQUIRED=true and an OTP provider configured, see lib/otp-sender.js):
+//    POST /api/auth/login {phone} sends a 6-digit code; POST /api/auth/verify-otp {phone, code}
+//    returns the session. No token or business list is ever returned before the code is verified.
+
+function businessListItem(b) { return { _id: b._id, name: b.name, slug: b.slug, type: b.type }; }
+
+async function findBusinessesByPhone(phone) {
+  return db.collection('businesses').find({ phone: { $in: phoneVariants(phone) } }).toArray();
+}
+
+async function issueSession(res, business, allBusinesses) {
+  const token = signOwnerToken(business);
+  await db.collection('businesses').updateOne({ _id: business._id }, { $set: { lastLogin: new Date() } });
+  return res.json({ exists: true, otpRequired: false, token, business: normalizeBusiness(business), businesses: allBusinesses });
+}
+
+function signLoginTicket(phone) {
+  return jwt.sign({ purpose: 'login', phone: phoneKey(phone) }, JWT_SECRET, { expiresIn: '10m' });
+}
+
+function verifyLoginTicket(ticket, phone) {
+  if (!isNonEmptyStr(ticket)) return false;
+  try {
+    const d = jwt.verify(ticket, JWT_SECRET);
+    return d && d.purpose === 'login' && d.phone === phoneKey(phone);
+  } catch { return false; }
+}
 
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
-    const { phone, slug } = req.body;
-    if (!phone) return res.status(400).json({ error: 'Phone is required' });
-    const businesses = await db.collection('businesses').find({ phone: sanitizeQuery(phone) }).toArray();
-    if (!businesses.length) return res.json({ exists: false });
-    const allBusinesses = businesses.map(b => ({ _id: b._id, name: b.name, slug: b.slug, type: b.type }));
+    const { phone, slug, loginTicket, lang } = req.body || {};
+    if (!isNonEmptyStr(phone)) return res.status(400).json({ error: 'Phone is required' });
+    const key = phoneKey(phone);
+
+    if (otpEnabled()) {
+      // Business selection after a verified code (multi-business phones)
+      if (loginTicket !== undefined) {
+        if (!verifyLoginTicket(loginTicket, phone)) return res.status(401).json({ error: 'Verification expired. Please log in again.', otpRequired: true });
+        const businesses = await findBusinessesByPhone(phone);
+        const business = businesses.find(b => b.slug === slug);
+        if (!business) return res.status(404).json({ error: 'Business not found' });
+        logAuth('login.ticket', req, { phone: maskPhone(phone), slug: business.slug });
+        return issueSession(res, business, businesses.map(businessListItem));
+      }
+
+      if (!isValidIsraeliPhone(phone)) return res.status(400).json({ error: 'Invalid phone number format' });
+      for (const lim of OTP_SEND_LIMITS) {
+        const k = lim.scope === 'phone' ? `otp-send:phone:${key}` : `otp-send:ip:${clientIp(req)}`;
+        const r = await mongoLimit.hit(db, k, lim.max, lim.windowMs);
+        if (!r.allowed) {
+          logAuth('otp.send.rate_limited', req, { phone: maskPhone(phone), scope: lim.scope });
+          res.set('Retry-After', String(r.retryAfterSec));
+          return res.status(429).json({ error: 'Too many code requests. Try again later.', retryAfter: r.retryAfterSec });
+        }
+      }
+      // Same response whether or not the phone is registered (no account enumeration).
+      const code = await otp.issue(db, OTP_SECRET, key);
+      try {
+        await otpSender.send(key, code, { lang });
+      } catch (err) {
+        console.error('[auth] OTP send failed:', err.message);
+        return res.status(502).json({ error: 'Could not send the verification code. Try again shortly.' });
+      }
+      logAuth('otp.sent', req, { phone: maskPhone(phone), via: otpSender.name });
+      return res.json({ otpRequired: true, sent: true, expiresIn: Math.round(otp.OTP_TTL_MS / 1000) });
+    }
+
+    // ---- Legacy phone-only login (until an OTP provider is configured) ----
+    const lim = await mongoLimit.hit(db, `login:phone:${key}`, PHONE_LOGIN_LIMIT.max, PHONE_LOGIN_LIMIT.windowMs);
+    if (!lim.allowed) {
+      logAuth('login.rate_limited', req, { phone: maskPhone(phone) });
+      res.set('Retry-After', String(lim.retryAfterSec));
+      return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
+    }
+    const businesses = await findBusinessesByPhone(phone);
+    if (!businesses.length) {
+      logAuth('login.unknown_phone', req, { phone: maskPhone(phone) });
+      return res.json({ exists: false, otpRequired: false });
+    }
+    const allBusinesses = businesses.map(businessListItem);
     // If multiple businesses and no slug specified, return list for selection (no token)
     if (businesses.length > 1 && !slug) {
-      return res.json({ exists: true, businesses: allBusinesses });
+      return res.json({ exists: true, otpRequired: false, businesses: allBusinesses });
     }
-    // Single business or slug specified — pick and return token
     let business = slug ? businesses.find(b => b.slug === slug) : businesses[0];
     if (!business) business = businesses[0];
-    const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
-    // Track last login
-    await db.collection('businesses').updateOne({ _id: business._id }, { $set: { lastLogin: new Date() } });
-    res.json({ exists: true, token, business, businesses: allBusinesses });
+    logAuth('login.ok', req, { phone: maskPhone(phone), slug: business.slug, mode: 'legacy' });
+    return issueSession(res, business, allBusinesses);
   } catch (err) {
     console.error('Login error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+const otpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: intEnv('OTP_VERIFY_RATE_LIMIT', 30),
+  message: { error: 'Too many attempts. Try again later.' },
+  validate: false,
+  keyGenerator: (req) => 'ip:' + clientIp(req),
+});
+
+app.post('/api/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
+  try {
+    if (!otpEnabled()) return res.status(400).json({ error: 'OTP login is not enabled' });
+    const { phone, code, slug } = req.body || {};
+    if (!isNonEmptyStr(phone) || !isStr(code) || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({ error: 'Phone and 6-digit code are required' });
+    }
+    const key = phoneKey(phone);
+    const result = await otp.verify(db, OTP_SECRET, key, code);
+    if (result !== 'ok') {
+      logAuth('otp.verify.fail', req, { phone: maskPhone(phone), result });
+      if (result === 'locked') return res.status(429).json({ error: 'Too many wrong codes. Request a new code.', code: 'otp_locked' });
+      if (result === 'expired') return res.status(400).json({ error: 'The code expired. Request a new code.', code: 'otp_expired' });
+      return res.status(400).json({ error: 'Wrong code', code: 'otp_invalid' });
+    }
+    const businesses = await findBusinessesByPhone(phone);
+    logAuth('otp.verify.ok', req, { phone: maskPhone(phone), businesses: businesses.length });
+    if (!businesses.length) return res.json({ exists: false, phoneVerified: true });
+    const allBusinesses = businesses.map(businessListItem);
+    if (businesses.length > 1 && !slug) {
+      return res.json({ exists: true, businesses: allBusinesses, loginTicket: signLoginTicket(phone) });
+    }
+    const business = (slug && businesses.find(b => b.slug === slug)) || businesses[0];
+    return issueSession(res, business, allBusinesses);
+  } catch (err) {
+    console.error('Verify OTP error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Sliding session: exchange a valid (unexpired) token for a fresh one.
+app.post('/api/auth/refresh', authMiddleware, async (req, res) => {
+  try {
+    const business = await db.collection('businesses').findOne({ _id: new ObjectId(req.businessId) });
+    if (!business) return res.status(401).json({ error: 'Session expired' });
+    res.json({ token: signOwnerToken(business) });
+  } catch (err) {
+    console.error('Refresh error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -322,7 +619,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
     const business = await db.collection('businesses').findOne({ _id: new ObjectId(req.businessId) });
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    res.json(business);
+    res.json(normalizeBusiness(business));
   } catch (err) {
     console.error('Auth me error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -334,7 +631,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 app.post('/api/push-tokens', authMiddleware, async (req, res) => {
   try {
     const { token, platform, appVersion, locale } = req.body || {};
-    if (!token || !Expo.isExpoPushToken(token)) {
+    if (!isStr(token) || !Expo.isExpoPushToken(token)) {
       return res.status(400).json({ error: 'Invalid Expo push token' });
     }
     const plat = platform === 'android' ? 'android' : 'ios';
@@ -346,7 +643,7 @@ app.post('/api/push-tokens', authMiddleware, async (req, res) => {
           token,
           business_id: req.businessId,
           platform: plat,
-          app_version: appVersion || null,
+          app_version: isStr(appVersion) ? appVersion : null,
           locale: locale === 'en' ? 'en' : 'he',
           last_seen_at: now,
         },
@@ -364,7 +661,7 @@ app.post('/api/push-tokens', authMiddleware, async (req, res) => {
 app.delete('/api/push-tokens', authMiddleware, async (req, res) => {
   try {
     const token = (req.body && req.body.token) || req.query.token;
-    if (!token) return res.status(400).json({ error: 'token required' });
+    if (!isNonEmptyStr(token)) return res.status(400).json({ error: 'token required' });
     await db.collection('push_tokens').deleteOne({
       token,
       business_id: req.businessId,
@@ -379,7 +676,8 @@ app.delete('/api/push-tokens', authMiddleware, async (req, res) => {
 // Account deletion (App Store 5.1.1(v)) — requires Bearer auth + confirmSlug match
 app.delete('/api/account', authMiddleware, async (req, res) => {
   try {
-    const confirmSlug = ((req.body && req.body.confirmSlug) || '').toLowerCase().trim();
+    const raw = req.body && req.body.confirmSlug;
+    const confirmSlug = (isStr(raw) ? raw : '').toLowerCase().trim();
     const business = await db.collection('businesses').findOne({ _id: new ObjectId(req.businessId) });
     if (!business) return res.status(404).json({ error: 'Business not found' });
     if (!confirmSlug || confirmSlug !== business.slug) {
@@ -397,7 +695,7 @@ app.delete('/api/account', authMiddleware, async (req, res) => {
       db.collection('push_tokens').deleteMany({ business_id: bidStr }),
       db.collection('businesses').deleteOne({ _id: bid }),
     ]);
-
+    logAuth('account.deleted', req, { slug: business.slug });
     res.json({ success: true, deleted: business.slug });
   } catch (err) {
     console.error('Account delete error:', err);
@@ -406,12 +704,16 @@ app.delete('/api/account', authMiddleware, async (req, res) => {
 });
 
 // ============ BOOKING TOKEN ============
+// Stored in MongoDB (TTL) so tokens survive restarts and work across instances.
+
+const BOOKING_TOKEN_TTL_MS = 10 * 60 * 1000;
 
 app.get('/api/businesses/:slug/booking-token', async (req, res) => {
   try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
     const token = crypto.randomBytes(16).toString('hex');
-    bookingTokens.set(token, { slug: req.params.slug, createdAt: Date.now(), used: false });
-    cleanExpiredTokens();
+    await db.collection('booking_tokens').insertOne({ _id: token, slug: business.slug, createdAt: new Date(), used: false });
     res.json({ token });
   } catch (err) {
     console.error('Booking token error:', err);
@@ -419,13 +721,38 @@ app.get('/api/businesses/:slug/booking-token', async (req, res) => {
   }
 });
 
+async function consumeBookingToken(token, slug) {
+  if (!isNonEmptyStr(token)) return false;
+  const r = await db.collection('booking_tokens').findOneAndUpdate(
+    { _id: token, slug, used: false, createdAt: { $gt: new Date(Date.now() - BOOKING_TOKEN_TTL_MS) } },
+    { $set: { used: true, usedAt: new Date() } }
+  );
+  return !!r;
+}
+
 // ============ BUSINESSES ============
+
+const DEFAULT_WORKING_HOURS = {
+  sunday: { start: '09:00', end: '18:00', enabled: true },
+  monday: { start: '09:00', end: '18:00', enabled: true },
+  tuesday: { start: '09:00', end: '18:00', enabled: true },
+  wednesday: { start: '09:00', end: '18:00', enabled: true },
+  thursday: { start: '09:00', end: '18:00', enabled: true },
+  friday: { start: '09:00', end: '14:00', enabled: true },
+  saturday: { start: '00:00', end: '00:00', enabled: false },
+};
+
+function cleanServiceInput(s) {
+  if (!s || typeof s !== 'object') return null;
+  const { id, ...rest } = s; // the client-side temporary `id` is not stored; `_id` is the key
+  return rest;
+}
 
 // Create business (rate limited)
 app.post('/api/businesses', createBusinessLimiter, async (req, res) => {
   try {
-    const { name, slug, type, phone, email, theme, workingHours, services } = req.body;
-    if (!name || !slug) return res.status(400).json({ error: 'Name and slug are required' });
+    const { name, slug, type, phone, email, theme, workingHours, services } = req.body || {};
+    if (!isNonEmptyStr(name) || !isNonEmptyStr(slug)) return res.status(400).json({ error: 'Name and slug are required' });
 
     const existing = await db.collection('businesses').findOne({ slug: slug.toLowerCase() });
     if (existing) return res.status(409).json({ error: 'Slug already taken' });
@@ -434,28 +761,20 @@ app.post('/api/businesses', createBusinessLimiter, async (req, res) => {
       name,
       slug: slug.toLowerCase(),
       type: type || 'general',
-      phone: phone || '',
-      email: email || '',
+      phone: isStr(phone) ? phone : '',
+      email: isStr(email) ? email : '',
       theme: theme || 'default',
       customization: { colors: {} },
-      workingHours: workingHours || {
-        sunday: { start: '09:00', end: '18:00', enabled: true },
-        monday: { start: '09:00', end: '18:00', enabled: true },
-        tuesday: { start: '09:00', end: '18:00', enabled: true },
-        wednesday: { start: '09:00', end: '18:00', enabled: true },
-        thursday: { start: '09:00', end: '18:00', enabled: true },
-        friday: { start: '09:00', end: '14:00', enabled: true },
-        saturday: { start: '00:00', end: '00:00', enabled: false }
-      },
-      services: (services || []).map(s => ({ ...s, _id: new ObjectId() })),
+      workingHours: (workingHours && typeof workingHours === 'object') ? workingHours : DEFAULT_WORKING_HOURS,
+      services: (Array.isArray(services) ? services : []).map(cleanServiceInput).filter(Boolean).map(s => ({ ...s, _id: new ObjectId() })),
       isActive: true,
       createdAt: new Date()
     };
 
     const result = await db.collection('businesses').insertOne(business);
     business._id = result.insertedId;
-    const token = jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: '30d' });
-    res.status(201).json({ ...business, token });
+    const token = signOwnerToken(business);
+    res.status(201).json({ ...normalizeBusiness(business), token });
   } catch (err) {
     console.error('Create business error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -467,18 +786,15 @@ app.get('/api/businesses/:slug', async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    // Return only public fields — NO phone, email, _id, createdAt
+    // Return only public fields — NO phone, email, createdAt
     const { name, slug, type, theme, services, workingHours, customization } = business;
-    // Include staff (public fields only)
-    const publicStaff = (business.staff || []).filter(s => s.isActive !== false).map(s => ({
-      _id: s._id, name: s.name, role: s.role, services: s.services || [], workingHours: s.workingHours || {}
-    }));
     res.json({
       name, slug, type, theme,
-      services: (services || []).map(s => ({ name: s.name, duration: s.duration, price: s.price, _id: s._id })),
+      timezone: T.businessTz(business),
+      services: (services || []).map(publicService),
       workingHours,
       customization,
-      staff: publicStaff
+      staff: (business.staff || []).filter(s => s.isActive !== false).map(publicStaff),
     });
   } catch (err) {
     console.error('Get business error:', err);
@@ -486,14 +802,20 @@ app.get('/api/businesses/:slug', async (req, res) => {
   }
 });
 
-// Update business by slug — PROTECTED
-app.put('/api/businesses/:slug', authMiddleware, async (req, res) => {
-  try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
-    if (business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+const REMINDER_SETTING_KEYS = ['1day', '2hours', '1hour', '30min', 'onBooking', 'postVisit'];
+function cleanReminderSettings(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const out = {};
+  for (const k of REMINDER_SETTING_KEYS) if (k in input) out[k] = input[k] === true;
+  if (isStr(input.template)) out.template = input.template.slice(0, 500);
+  return out;
+}
 
-    const { name, type, phone, email, theme, customization, workingHours, services, staff } = req.body;
+// Update business by slug — PROTECTED
+app.put('/api/businesses/:slug', requireOwner, async (req, res) => {
+  try {
+    const business = req.business;
+    const { name, type, phone, email, theme, customization, workingHours, services, staff, reminderSettings } = req.body || {};
     const update = {};
     if (name !== undefined) update.name = name;
     if (type !== undefined) update.type = type;
@@ -502,16 +824,30 @@ app.put('/api/businesses/:slug', authMiddleware, async (req, res) => {
     if (theme !== undefined) update.theme = theme;
     if (customization !== undefined) update.customization = customization;
     if (workingHours !== undefined) update.workingHours = workingHours;
-    if (services !== undefined) update.services = services.map(s => ({ ...s, _id: s._id ? new ObjectId(s._id) : new ObjectId() }));
-    if (staff !== undefined) update.staff = staff.map(s => ({ ...s, _id: s._id ? new ObjectId(s._id) : new ObjectId() }));
+    if (reminderSettings !== undefined) {
+      const rs = cleanReminderSettings(reminderSettings);
+      if (!rs) return res.status(400).json({ error: 'Invalid reminderSettings' });
+      update.reminderSettings = rs;
+    }
+    if (services !== undefined) {
+      if (!Array.isArray(services)) return res.status(400).json({ error: 'services must be an array' });
+      update.services = services.map(cleanServiceInput).filter(Boolean).map(s => ({ ...s, _id: toObjectId(String(s._id || '')) || new ObjectId() }));
+    }
+    if (staff !== undefined) {
+      if (!Array.isArray(staff)) return res.status(400).json({ error: 'staff must be an array' });
+      update.staff = staff.filter(s => s && typeof s === 'object').map(s => {
+        const { id, ...rest } = s;
+        return { ...rest, _id: toObjectId(String(s._id || id || '')) || new ObjectId() };
+      });
+    }
 
     const result = await db.collection('businesses').findOneAndUpdate(
-      { slug: req.params.slug },
+      { _id: business._id },
       { $set: update },
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Business not found' });
-    res.json(result);
+    res.json(normalizeBusiness(result));
   } catch (err) {
     console.error('Update business by slug error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -529,79 +865,84 @@ app.get('/api/check-username/:username', async (req, res) => {
   }
 });
 
-// ============ SERVICES (PROTECTED) ============
+// ============ SERVICES ============
+
+function validDuration(v) { const n = Number(v); return Number.isInteger(n) && n > 0 && n <= 24 * 60; }
+function validPrice(v) { const n = Number(v); return Number.isFinite(n) && n >= 0; }
 
 app.get('/api/businesses/:slug/services', async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    res.json((business.services || []).map(s => ({ name: s.name, duration: s.duration, price: s.price, _id: s._id })));
+    res.json((business.services || []).map(publicService));
   } catch (err) {
     console.error('List services error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/businesses/:slug/services', authMiddleware, async (req, res) => {
+app.post('/api/businesses/:slug/services', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+    const { name, duration, price, currency } = req.body || {};
+    if (!isNonEmptyStr(name) || duration === undefined) return res.status(400).json({ error: 'Name and duration are required' });
+    if (!validDuration(duration)) return res.status(400).json({ error: 'Duration must be a whole number of minutes between 1 and 1440' });
+    if (price !== undefined && price !== '' && !validPrice(price)) return res.status(400).json({ error: 'Price must be 0 or more' });
 
-    const { name, duration, price, currency } = req.body;
-    if (!name || !duration) return res.status(400).json({ error: 'Name and duration are required' });
-
-    const service = { _id: new ObjectId(), name, duration: Number(duration), price: Number(price) || 0, currency: currency || 'ILS' };
+    const service = { _id: new ObjectId(), name, duration: Number(duration), price: Number(price) || 0, currency: isStr(currency) ? currency : 'ILS' };
 
     const result = await db.collection('businesses').findOneAndUpdate(
-      { slug: req.params.slug },
+      { _id: req.business._id },
       { $push: { services: service } },
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Business not found' });
-    res.status(201).json(service);
+    res.status(201).json(withId(service));
   } catch (err) {
     console.error('Add service error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.put('/api/businesses/:slug/services/:id', authMiddleware, async (req, res) => {
+app.put('/api/businesses/:slug/services/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { name, duration, price, currency } = req.body;
+    const { name, duration, price, currency } = req.body || {};
     const update = {};
-    if (name !== undefined) update['services.$.name'] = name;
-    if (duration !== undefined) update['services.$.duration'] = Number(duration);
-    if (price !== undefined) update['services.$.price'] = Number(price);
+    if (name !== undefined) {
+      if (!isNonEmptyStr(name)) return res.status(400).json({ error: 'Name is required' });
+      update['services.$.name'] = name;
+    }
+    if (duration !== undefined) {
+      if (!validDuration(duration)) return res.status(400).json({ error: 'Duration must be a whole number of minutes between 1 and 1440' });
+      update['services.$.duration'] = Number(duration);
+    }
+    if (price !== undefined) {
+      if (!validPrice(price)) return res.status(400).json({ error: 'Price must be 0 or more' });
+      update['services.$.price'] = Number(price);
+    }
     if (currency !== undefined) update['services.$.currency'] = currency;
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
 
     const result = await db.collection('businesses').findOneAndUpdate(
-      { slug: req.params.slug, 'services._id': new ObjectId(req.params.id) },
+      { _id: req.business._id, 'services._id': new ObjectId(req.params.id) },
       { $set: update },
       { returnDocument: 'after' }
     );
-    if (!result) return res.status(404).json({ error: 'Business or service not found' });
-    const svc = result.services.find(s => s._id.toString() === req.params.id);
-    res.json(svc);
+    if (!result) return res.status(404).json({ error: 'Service not found' });
+    const svc = result.services.find(s => s._id && s._id.toString() === req.params.id);
+    res.json(withId(svc));
   } catch (err) {
     console.error('Update service error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.delete('/api/businesses/:slug/services/:id', authMiddleware, async (req, res) => {
+app.delete('/api/businesses/:slug/services/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const result = await db.collection('businesses').findOneAndUpdate(
-      { slug: req.params.slug },
-      { $pull: { services: { _id: new ObjectId(req.params.id) } } },
-      { returnDocument: 'after' }
+    const r = await db.collection('businesses').updateOne(
+      { _id: req.business._id, 'services._id': new ObjectId(req.params.id) },
+      { $pull: { services: { _id: new ObjectId(req.params.id) } } }
     );
-    if (!result) return res.status(404).json({ error: 'Business not found' });
+    if (r.matchedCount === 0) return res.status(404).json({ error: 'Service not found' });
     res.json({ success: true });
   } catch (err) {
     console.error('Delete service error:', err);
@@ -609,16 +950,237 @@ app.delete('/api/businesses/:slug/services/:id', authMiddleware, async (req, res
   }
 });
 
+// ============ BOOKING ENGINE ============
+
+const APPOINTMENT_STATUSES = ['pending', 'confirmed', 'declined', 'cancelled', 'completed', 'no_show', 'reschedule_requested'];
+const INACTIVE_STATUSES = ['cancelled', 'declined'];
+
+/** "HH:MM" → minutes; also accepts "24:00" (closing time). null if malformed. */
+function parseHM(s) {
+  if (typeof s !== 'string') return null;
+  const m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = Number(m[1]), mi = Number(m[2]);
+  if (h > 24 || mi > 59 || (h === 24 && mi > 0)) return null;
+  return h * 60 + mi;
+}
+
+function businessDayHours(business, dayName) {
+  const bh = business.workingHours && business.workingHours[dayName];
+  if (!bh || !bh.enabled) return null;
+  const start = parseHM(bh.start), end = parseHM(bh.end);
+  if (start == null || end == null || end <= start) return null;
+  return { start, end, raw: bh };
+}
+
+function activeStaff(business) {
+  return (business.staff || []).filter(s => s && s._id && s.isActive !== false);
+}
+
+function staffProvides(sm, svcKey) {
+  return !Array.isArray(sm.services) || sm.services.length === 0 || sm.services.some(id => String(id) === svcKey);
+}
+
+/** Staff hours for the day: explicit entry wins, otherwise the business hours. null = off. */
+function staffDayHours(sm, dayName, bizHours) {
+  const sh = sm.workingHours && sm.workingHours[dayName];
+  if (sh && typeof sh === 'object') {
+    if (sh.enabled === false) return null;
+    const start = parseHM(sh.start), end = parseHM(sh.end);
+    if (start != null && end != null && end > start) return { start, end };
+  }
+  return bizHours ? { start: bizHours.start, end: bizHours.end } : null;
+}
+
+function apptRange(a) {
+  const s = parseHM(a.startTime), e = parseHM(a.endTime);
+  if (s == null) return null;
+  return { start: s, end: e != null && e > s ? e : s + 30 };
+}
+
+function overlaps(a, start, end) {
+  const r = apptRange(a);
+  return !!r && r.start < end && r.end > start;
+}
+
+async function dayAppointments(business, date, excludeId) {
+  const q = { businessId: bizIdFilter(business), date, status: { $nin: INACTIVE_STATUSES } };
+  if (excludeId) q._id = { $ne: excludeId };
+  return db.collection('appointments').find(q).toArray();
+}
+
+/**
+ * Staff members free for [start,end). Appointments without a staff member consume
+ * capacity (one person each) because we don't know who will serve them.
+ */
+function freeStaff(eligible, appts, start, end, { dayName, bizHours, enforceHours }) {
+  const overlapping = appts.filter(a => overlaps(a, start, end));
+  const busy = new Set(overlapping.filter(a => a.staffId).map(a => String(a.staffId)));
+  const unassigned = overlapping.filter(a => !a.staffId).length;
+  const free = eligible.filter(sm => {
+    if (busy.has(sm._id.toString())) return false;
+    if (enforceHours) {
+      const h = staffDayHours(sm, dayName, bizHours);
+      if (!h || start < h.start || end > h.end) return false;
+    }
+    return true;
+  });
+  return free.length > unassigned ? free : [];
+}
+
+function perDayServiceAllowed(bizHoursRaw, svcKey) {
+  if (bizHoursRaw && bizHoursRaw.serviceMode === 'custom' && Array.isArray(bizHoursRaw.enabledServices)) {
+    return bizHoursRaw.enabledServices.some(id => String(id) === svcKey);
+  }
+  return true;
+}
+
+class BookingError extends Error {
+  constructor(status, message, code) { super(message); this.status = status; this.code = code; }
+}
+
+/**
+ * Validate and create an appointment.
+ * Public bookings: must be in the future, on an open day, inside business (and staff) hours.
+ * Owner bookings: may be outside hours (walk-ins, overtime) but not on a past date.
+ */
+async function createAppointment(business, input, { isOwner }) {
+  const { serviceId, staffId, customerName, customerPhone, customerEmail, date, startTime, notes } = input;
+
+  if (!isNonEmptyStr(customerName) || !isNonEmptyStr(customerPhone) || !isNonEmptyStr(date) || !isNonEmptyStr(startTime) || !isNonEmptyStr(serviceId)) {
+    throw new BookingError(400, 'Missing required fields: customerName, customerPhone, date, startTime, serviceId', 'missing_fields');
+  }
+  if (!isValidIsraeliPhone(customerPhone)) throw new BookingError(400, 'Invalid phone number format', 'invalid_phone');
+  if (!T.isValidYMD(date)) throw new BookingError(400, 'Invalid date (expected YYYY-MM-DD)', 'invalid_date');
+  if (!T.isValidHM(startTime)) throw new BookingError(400, 'Invalid start time (expected HH:MM)', 'invalid_time');
+  if (staffId !== undefined && staffId !== null && staffId !== '' && !isStr(staffId)) throw new BookingError(400, 'Invalid staffId', 'invalid_staff');
+
+  const service = findService(business, serviceId);
+  if (!service) throw new BookingError(400, 'Service not found', 'service_not_found');
+  const duration = Number(service.duration);
+  if (!validDuration(duration)) throw new BookingError(400, 'Service has an invalid duration', 'invalid_service');
+  const svcKey = serviceKey(service);
+
+  const start = T.hmToMin(startTime);
+  const end = start + duration;
+  if (end > 24 * 60) throw new BookingError(400, 'Appointment must end by midnight', 'outside_hours');
+  const endTime = T.minToHM(end);
+
+  const tz = T.businessTz(business);
+  const now = T.nowInTz(tz);
+  if (date < now.date) throw new BookingError(400, 'Cannot book a date in the past', 'past');
+  if (!isOwner && date === now.date && start <= now.minutes) throw new BookingError(400, 'Cannot book a time in the past', 'past');
+
+  const dayName = T.dayNameOf(date);
+  const bizHours = businessDayHours(business, dayName);
+  if (!isOwner) {
+    if (!bizHours) throw new BookingError(400, 'The business is closed on this day', 'closed');
+    if (start < bizHours.start || end > bizHours.end) throw new BookingError(400, 'Outside working hours', 'outside_hours');
+  }
+  const rawDay = business.workingHours && business.workingHours[dayName];
+  if (!perDayServiceAllowed(rawDay, svcKey)) throw new BookingError(400, 'Service not available on this day', 'service_unavailable_day');
+
+  const appts = await dayAppointments(business, date);
+  const staffAll = activeStaff(business);
+  let staffMember = null;
+
+  if (isNonEmptyStr(staffId)) {
+    const sm = (business.staff || []).find(s => s && s._id && s._id.toString() === staffId);
+    if (!sm) throw new BookingError(400, 'Staff member not found', 'staff_not_found');
+    if (sm.isActive === false) throw new BookingError(400, 'Staff member is inactive', 'staff_inactive');
+    if (!staffProvides(sm, svcKey)) throw new BookingError(400, 'Staff member does not provide this service', 'staff_service');
+    if (!isOwner) {
+      const h = staffDayHours(sm, dayName, bizHours);
+      if (!h) throw new BookingError(400, 'Staff member not available on this day', 'staff_day_off');
+      if (start < h.start || end > h.end) throw new BookingError(400, 'Outside the staff member\'s working hours', 'outside_hours');
+    }
+    if (appts.some(a => a.staffId && String(a.staffId) === staffId && overlaps(a, start, end))) {
+      throw new BookingError(409, 'Time slot already booked', 'conflict');
+    }
+    staffMember = sm;
+  } else if (staffAll.length > 0) {
+    // "Any staff": assign the first free staff member who provides the service.
+    const eligible = staffAll.filter(sm => staffProvides(sm, svcKey));
+    if (!eligible.length) throw new BookingError(400, 'No staff member provides this service', 'staff_service');
+    const free = freeStaff(eligible, appts, start, end, { dayName, bizHours, enforceHours: !isOwner });
+    if (!free.length) throw new BookingError(409, 'Time slot already booked', 'conflict');
+    staffMember = free[0];
+  } else if (appts.some(a => overlaps(a, start, end))) {
+    throw new BookingError(409, 'Time slot already booked', 'conflict');
+  }
+
+  const appointment = {
+    businessId: business._id,
+    serviceId: service._id || svcKey,
+    serviceName: service.name,
+    staffId: staffMember ? staffMember._id.toString() : '',
+    staffName: staffMember ? (staffMember.name || '') : '',
+    customerName,
+    customerPhone,
+    customerEmail: isStr(customerEmail) ? customerEmail : '',
+    date,
+    startTime,
+    endTime,
+    duration,
+    price: Number(service.price) || 0,
+    status: 'pending',
+    notes: isStr(notes) ? notes : '',
+    source: isOwner ? 'owner' : 'online',
+    createdAt: new Date()
+  };
+
+  const result = await db.collection('appointments').insertOne(appointment);
+  appointment._id = result.insertedId;
+
+  // Auto-create or update customer
+  const bidStr = business._id.toString();
+  const existingCustomer = await db.collection('customers').findOne({ businessId: bizIdFilter(business), phone: customerPhone });
+  if (existingCustomer) {
+    await db.collection('customers').updateOne(
+      { _id: existingCustomer._id },
+      { $set: { lastVisit: new Date(), name: customerName }, $inc: { totalVisits: 1, totalSpent: service.price || 0 } }
+    );
+  } else {
+    await db.collection('customers').insertOne({
+      businessId: bidStr,
+      name: customerName,
+      phone: customerPhone,
+      email: isStr(customerEmail) ? customerEmail : '',
+      notes: '',
+      isVip: false,
+      tags: [],
+      totalVisits: 1,
+      totalSpent: service.price || 0,
+      lastVisit: new Date(),
+      birthday: '',
+      createdAt: new Date(),
+    });
+  }
+
+  // Push notify owner devices (non-blocking)
+  void notifyBusiness(business._id, {
+    titleKey: 'new_booking_title',
+    bodyKey: 'new_booking_body',
+    payload: {
+      customerName: appointment.customerName,
+      serviceName: appointment.serviceName,
+      date: appointment.date,
+      time: appointment.startTime,
+    },
+    url: '/(dashboard)/appointments',
+  }).catch(err => console.error('notify error', err && err.message));
+
+  return appointment;
+}
+
+function apptOut(a) { return a ? { ...a, id: a._id.toString() } : a; }
+
 // ============ APPOINTMENTS ============
 
 // List appointments — PROTECTED (only owner)
-app.get('/api/businesses/:slug/appointments', authMiddleware, async (req, res) => {
+app.get('/api/businesses/:slug/appointments', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
-    if (business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const query = { businessId: business._id };
+    const query = { businessId: bizIdFilter(req.business) };
     if (req.query.date) {
       query.date = sanitizeQuery(req.query.date);
     } else {
@@ -628,186 +1190,62 @@ app.get('/api/businesses/:slug/appointments', authMiddleware, async (req, res) =
     if (req.query.status) query.status = sanitizeQuery(req.query.status);
 
     const appointments = await db.collection('appointments').find(query).toArray();
-    appointments.sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
-    res.json(appointments);
+    appointments.sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.startTime).localeCompare(String(b.startTime)));
+    res.json(appointments.map(apptOut));
   } catch (err) {
     console.error('List appointments error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Book appointment — PUBLIC (with booking token + rate limit)
+// Book appointment — PUBLIC (with booking token + rate limit) or by the owner (Bearer token)
 app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
 
-    // Check if request is from authenticated business owner
-    const { bookingToken, serviceId, staffId, customerName, customerPhone, customerEmail, date, startTime, notes } = req.body;
-    const authHeader = req.headers.authorization;
+    const body = req.body || {};
+    // Owner booking only when the token is valid AND belongs to this exact business.
     let isOwner = false;
-    if (authHeader) {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
       try {
-        const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-        if (decoded.slug === req.params.slug) isOwner = true;
+        const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
+        if (decoded.businessId === business._id.toString()) isOwner = true;
       } catch {}
     }
 
     // Verify booking token only for public (non-owner) bookings
-    if (!isOwner) {
-      const bt = bookingTokens.get(bookingToken);
-      if (!bt || bt.used || bt.slug !== req.params.slug || Date.now() - bt.createdAt > 600000) {
-        return res.status(403).json({ error: 'Invalid or expired booking token' });
-      }
-      bt.used = true;
+    if (!isOwner && !(await consumeBookingToken(body.bookingToken, business.slug))) {
+      return res.status(403).json({ error: 'Invalid or expired booking token', code: 'booking_token' });
     }
 
-    if (!customerName || !customerPhone || !date || !startTime || !serviceId) {
-      return res.status(400).json({ error: 'Missing required fields: customerName, customerPhone, date, startTime, serviceId' });
-    }
-
-    // Validate Israeli phone
-    if (!isValidIsraeliPhone(customerPhone)) {
-      return res.status(400).json({ error: 'Invalid phone number format' });
-    }
-
-    // Find service
-    let service = business.services.find(s => s._id && s._id.toString() === serviceId);
-    if (!service && !isNaN(serviceId)) service = business.services[parseInt(serviceId)];
-    if (!service && business.services.length > 0) service = business.services.find(s => s.name === serviceId);
-    if (!service) return res.status(400).json({ error: 'Service not found' });
-
-    // Validate per-day service availability
-    const dayOfWeek = new Date(date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
-    const dayHours = business.workingHours?.[dayOfWeek];
-    if (dayHours && dayHours.serviceMode === 'custom' && Array.isArray(dayHours.enabledServices)) {
-      const svcId = (service._id || serviceId).toString();
-      if (!dayHours.enabledServices.some(id => id.toString() === svcId)) {
-        return res.status(400).json({ error: 'Service not available on this day' });
-      }
-    }
-
-    // Validate staff member if provided
-    let staffName = '';
-    let resolvedStaffId = staffId || '';
-    if (staffId && business.staff?.length > 0) {
-      const sm = business.staff.find(s => s._id?.toString() === staffId);
-      if (!sm) return res.status(400).json({ error: 'Staff member not found' });
-      if (sm.isActive === false) return res.status(400).json({ error: 'Staff member is inactive' });
-      staffName = sm.name || '';
-      const staffHours = sm.workingHours?.[dayOfWeek];
-      if (staffHours && !staffHours.enabled) {
-        return res.status(400).json({ error: 'Staff member not available on this day' });
-      }
-      if (sm.services?.length > 0) {
-        const svcId = (service._id || serviceId).toString();
-        if (!sm.services.includes(svcId) && !sm.services.some(sid => sid.toString() === svcId)) {
-          return res.status(400).json({ error: 'Staff member does not provide this service' });
-        }
-      }
-    } else if (business.staff?.length > 0 && !isOwner) {
-      return res.status(400).json({ error: 'Staff selection required' });
-    }
-
-    // Calculate end time
-    const [h, m] = startTime.split(':').map(Number);
-    const endMinutes = h * 60 + m + service.duration;
-    const endTime = `${String(Math.floor(endMinutes / 60)).padStart(2, '0')}:${String(endMinutes % 60).padStart(2, '0')}`;
-
-    // Check for conflicts (scoped to staff if provided)
-    const conflictQuery = {
-      businessId: business._id,
-      date,
-      status: { $ne: 'cancelled' },
-      startTime: { $lt: endTime },
-      endTime: { $gt: startTime }
-    };
-    if (resolvedStaffId) conflictQuery.staffId = resolvedStaffId;
-    const conflict = await db.collection('appointments').findOne(conflictQuery);
-    if (conflict) return res.status(409).json({ error: 'Time slot already booked' });
-
-    const appointment = {
-      businessId: business._id,
-      serviceId: service._id || serviceId,
-      serviceName: service.name,
-      staffId: resolvedStaffId,
-      staffName,
-      customerName,
-      customerPhone,
-      customerEmail: customerEmail || '',
-      date,
-      startTime,
-      endTime,
-      status: 'pending',
-      notes: notes || '',
-      createdAt: new Date()
-    };
-
-    const result = await db.collection('appointments').insertOne(appointment);
-    appointment._id = result.insertedId;
-
-    // Auto-create or update customer
-    const existingCustomer = await db.collection('customers').findOne({
-      businessId: business._id.toString(),
-      phone: customerPhone,
-    });
-    if (existingCustomer) {
-      await db.collection('customers').updateOne(
-        { _id: existingCustomer._id },
-        { $set: { lastVisit: new Date(), name: customerName }, $inc: { totalVisits: 1, totalSpent: service.price || 0 } }
-      );
-    } else {
-      await db.collection('customers').insertOne({
-        businessId: business._id.toString(),
-        name: customerName,
-        phone: customerPhone,
-        email: customerEmail || '',
-        notes: '',
-        isVip: false,
-        tags: [],
-        totalVisits: 1,
-        totalSpent: service.price || 0,
-        lastVisit: new Date(),
-        birthday: '',
-        createdAt: new Date(),
-      });
-    }
-
-    // Push notify owner devices (non-blocking)
-    void notifyBusiness(business._id, {
-      titleKey: 'new_booking_title',
-      bodyKey: 'new_booking_body',
-      payload: {
-        customerName: appointment.customerName,
-        serviceName: appointment.serviceName,
-        date: appointment.date,
-        time: appointment.startTime,
-      },
-      url: '/(dashboard)/appointments',
-    });
-
-    res.status(201).json(appointment);
+    const appointment = await createAppointment(business, body, { isOwner });
+    res.status(201).json(apptOut(appointment));
   } catch (err) {
+    if (err instanceof BookingError) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error('Book appointment error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Update appointment — PROTECTED
-app.put('/api/businesses/:slug/appointments/:id', authMiddleware, async (req, res) => {
+app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { status, notes, confirmationNote, cancellationReason } = req.body;
+    const business = req.business;
+    const { status, notes, confirmationNote, cancellationReason } = req.body || {};
     const update = {};
-    if (status) update.status = status;
+    if (status !== undefined) {
+      if (!APPOINTMENT_STATUSES.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+      update.status = status;
+    }
     if (notes !== undefined) update.notes = notes;
     if (confirmationNote !== undefined) update.confirmationNote = confirmationNote;
     if (cancellationReason !== undefined) update.cancellationReason = cancellationReason;
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
 
     const result = await db.collection('appointments').findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      ownedFilter(business, req.params.id),
       { $set: update },
       { returnDocument: 'after' }
     );
@@ -824,10 +1262,10 @@ app.put('/api/businesses/:slug/appointments/:id', authMiddleware, async (req, re
           time: result.startTime,
         },
         url: '/(dashboard)/appointments',
-      });
+      }).catch(() => {});
     }
 
-    res.json(result);
+    res.json(apptOut(result));
   } catch (err) {
     console.error('Update appointment error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -835,17 +1273,15 @@ app.put('/api/businesses/:slug/appointments/:id', authMiddleware, async (req, re
 });
 
 // Cancel appointment — PROTECTED
-app.delete('/api/businesses/:slug/appointments/:id', authMiddleware, async (req, res) => {
+app.delete('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
+    const business = req.business;
     const { cancellationReason } = req.body || {};
     const update = { status: 'cancelled' };
-    if (cancellationReason) update.cancellationReason = cancellationReason;
+    if (isStr(cancellationReason) && cancellationReason) update.cancellationReason = cancellationReason;
 
     const result = await db.collection('appointments').findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      ownedFilter(business, req.params.id),
       { $set: update },
       { returnDocument: 'after' }
     );
@@ -861,9 +1297,9 @@ app.delete('/api/businesses/:slug/appointments/:id', authMiddleware, async (req,
         time: result.startTime,
       },
       url: '/(dashboard)/appointments',
-    });
+    }).catch(() => {});
 
-    res.json({ success: true, appointment: result });
+    res.json({ success: true, appointment: apptOut(result) });
   } catch (err) {
     console.error('Cancel appointment error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -872,71 +1308,78 @@ app.delete('/api/businesses/:slug/appointments/:id', authMiddleware, async (req,
 
 // ============ RESCHEDULE (PROTECTED) ============
 
-app.post('/api/businesses/:slug/appointments/:id/reschedule', authMiddleware, async (req, res) => {
+app.post('/api/businesses/:slug/appointments/:id/reschedule', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { requestedDate, requestedTime, reason } = req.body;
-    if (!requestedDate || !requestedTime) {
+    const { requestedDate, requestedTime, reason } = req.body || {};
+    if (!isNonEmptyStr(requestedDate) || !isNonEmptyStr(requestedTime)) {
       return res.status(400).json({ error: 'requestedDate and requestedTime are required' });
+    }
+    if (!T.isValidYMD(requestedDate) || !T.isValidHM(requestedTime)) {
+      return res.status(400).json({ error: 'Invalid requestedDate/requestedTime format' });
     }
 
     const rescheduleRequest = {
       _id: new ObjectId(),
       requestedDate,
       requestedTime,
-      reason: reason || '',
+      reason: isStr(reason) ? reason : '',
       status: 'pending',
       createdAt: new Date()
     };
 
     const result = await db.collection('appointments').findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      ownedFilter(req.business, req.params.id),
       { $set: { status: 'reschedule_requested', rescheduleRequest } },
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Appointment not found' });
-    res.json(result);
+    res.json(apptOut(result));
   } catch (err) {
     console.error('Reschedule request error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', authMiddleware, async (req, res) => {
+app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { action } = req.body;
+    const business = req.business;
+    const { action } = req.body || {};
     if (!['accept', 'decline'].includes(action)) {
       return res.status(400).json({ error: 'action must be accept or decline' });
     }
 
-    const appointment = await db.collection('appointments').findOne({ _id: new ObjectId(req.params.id) });
+    const filter = ownedFilter(business, req.params.id);
+    const appointment = await db.collection('appointments').findOne(filter);
     if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+    const rr = appointment.rescheduleRequest;
+    if (!rr || String(rr._id) !== req.params.requestId) return res.status(404).json({ error: 'Reschedule request not found' });
+    if (rr.status && rr.status !== 'pending') return res.status(400).json({ error: 'Reschedule request already handled' });
 
     let update;
     if (action === 'accept') {
-      update = {
-        $set: {
-          date: appointment.rescheduleRequest.requestedDate,
-          startTime: appointment.rescheduleRequest.requestedTime,
-          status: 'confirmed',
-          'rescheduleRequest.status': 'accepted'
-        }
-      };
+      const date = rr.requestedDate, startTime = rr.requestedTime;
+      if (!T.isValidYMD(date) || !T.isValidHM(startTime)) return res.status(400).json({ error: 'Invalid requested date/time' });
+      const range = apptRange(appointment);
+      const svc = findService(business, String(appointment.serviceId || ''));
+      const duration = Number(appointment.duration) || (range ? range.end - range.start : 0) || (svc && Number(svc.duration)) || 30;
+      const start = T.hmToMin(startTime), end = start + duration;
+      if (end > 24 * 60) return res.status(400).json({ error: 'Appointment must end by midnight' });
+      const now = T.nowInTz(T.businessTz(business));
+      if (date < now.date) return res.status(400).json({ error: 'Cannot move an appointment into the past' });
+      const others = await dayAppointments(business, date, appointment._id);
+      const conflict = others.some(a => {
+        if (appointment.staffId) return (!a.staffId || String(a.staffId) === String(appointment.staffId)) && overlaps(a, start, end);
+        return overlaps(a, start, end);
+      });
+      if (conflict) return res.status(409).json({ error: 'Time slot already booked' });
+      update = { $set: { date, startTime, endTime: T.minToHM(end), status: 'confirmed', 'rescheduleRequest.status': 'accepted' } };
     } else {
       update = { $set: { status: 'confirmed', 'rescheduleRequest.status': 'declined' } };
     }
 
-    const result = await db.collection('appointments').findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
-      update,
-      { returnDocument: 'after' }
-    );
-    res.json(result);
+    const result = await db.collection('appointments').findOneAndUpdate(filter, update, { returnDocument: 'after' });
+    if (!result) return res.status(404).json({ error: 'Appointment not found' });
+    res.json(apptOut(result));
   } catch (err) {
     console.error('Reschedule response error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -952,10 +1395,10 @@ app.get('/api/businesses/:slug/announcements', async (req, res) => {
     if (!business) return res.status(404).json({ error: 'Business not found' });
 
     const announcements = await db.collection('announcements')
-      .find({ businessId: { $in: [business._id, business._id.toString()] }, isActive: true })
+      .find({ businessId: bizIdFilter(business), isActive: true })
       .toArray();
     announcements.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    res.json(announcements);
+    res.json(announcements.map(apptOut));
   } catch (err) {
     console.error('Get announcements error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
@@ -963,18 +1406,15 @@ app.get('/api/businesses/:slug/announcements', async (req, res) => {
 });
 
 // Create announcement — PROTECTED
-app.post('/api/businesses/:slug/announcements', authMiddleware, async (req, res) => {
+app.post('/api/businesses/:slug/announcements', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
+    const { message } = req.body || {};
+    if (!isNonEmptyStr(message)) return res.status(400).json({ error: 'Message is required' });
 
-    const { message } = req.body;
-    if (!message) return res.status(400).json({ error: 'Message is required' });
-
-    const announcement = { businessId: business._id, message, isActive: true, createdAt: new Date() };
+    const announcement = { businessId: req.business._id, message, isActive: true, createdAt: new Date() };
     const result = await db.collection('announcements').insertOne(announcement);
     announcement._id = result.insertedId;
-    res.status(201).json(announcement);
+    res.status(201).json(apptOut(announcement));
   } catch (err) {
     console.error('Create announcement error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -982,13 +1422,10 @@ app.post('/api/businesses/:slug/announcements', authMiddleware, async (req, res)
 });
 
 // Delete announcement — PROTECTED
-app.delete('/api/businesses/:slug/announcements/:id', authMiddleware, async (req, res) => {
+app.delete('/api/businesses/:slug/announcements/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
     const result = await db.collection('announcements').findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      ownedFilter(req.business, req.params.id),
       { $set: { isActive: false } },
       { returnDocument: 'after' }
     );
@@ -1002,12 +1439,9 @@ app.delete('/api/businesses/:slug/announcements/:id', authMiddleware, async (req
 
 // ============ CUSTOMERS (ALL PROTECTED) ============
 
-app.get('/api/businesses/:slug/customers', authMiddleware, async (req, res) => {
+app.get('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const query = { businessId: business._id.toString() };
+    const query = { businessId: bizIdFilter(req.business) };
     const { filter, search } = req.query;
 
     const now = new Date();
@@ -1032,26 +1466,24 @@ app.get('/api/businesses/:slug/customers', authMiddleware, async (req, res) => {
 
     const customers = await db.collection('customers').find(query).toArray();
     customers.sort((a, b) => new Date(b.lastVisit || 0) - new Date(a.lastVisit || 0));
-    res.json(customers);
+    res.json(customers.map(apptOut));
   } catch (err) {
     console.error('List customers error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/businesses/:slug/customers/groups', authMiddleware, async (req, res) => {
+app.get('/api/businesses/:slug/customers/groups', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const bid = business._id.toString();
+    const business = req.business;
+    const bid = bizIdFilter(business);
     const now = new Date();
     const thirtyDaysAgo = new Date(now - 30 * 86400000);
     const threeMonthsAgo = new Date(now - 90 * 86400000);
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const mmdd = `${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
-    const [all, recent, inactive, newC, vip, birthdays] = await Promise.all([
+    const [all, recent, inactive, newC, vip] = await Promise.all([
       db.collection('customers').countDocuments({ businessId: bid }),
       db.collection('customers').countDocuments({ businessId: bid, lastVisit: { $gte: thirtyDaysAgo } }),
       db.collection('customers').countDocuments({ businessId: bid, $or: [{ lastVisit: { $lt: threeMonthsAgo } }, { lastVisit: null }] }),
@@ -1061,8 +1493,8 @@ app.get('/api/businesses/:slug/customers/groups', authMiddleware, async (req, re
     ]);
 
     const cancelled = await db.collection('appointments').countDocuments({
-      businessId: business._id, status: 'cancelled',
-      date: { $gte: new Date(now - 30 * 86400000).toISOString().split('T')[0] }
+      businessId: bid, status: 'cancelled',
+      date: { $gte: T.addDays(T.todayInTz(T.businessTz(business)), -30) }
     });
 
     res.json([
@@ -1079,72 +1511,65 @@ app.get('/api/businesses/:slug/customers/groups', authMiddleware, async (req, re
   }
 });
 
-app.post('/api/businesses/:slug/customers', authMiddleware, async (req, res) => {
+app.post('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { name, phone, email, notes, birthday } = req.body;
-    if (!name || !phone) return res.status(400).json({ error: 'Name and phone are required' });
+    const { name, phone, email, notes, birthday } = req.body || {};
+    if (!isNonEmptyStr(name) || !isNonEmptyStr(phone)) return res.status(400).json({ error: 'Name and phone are required' });
 
     const customer = {
-      businessId: business._id.toString(),
-      name, phone, email: email || '', notes: notes || '',
+      businessId: req.business._id.toString(),
+      name, phone, email: isStr(email) ? email : '', notes: isStr(notes) ? notes : '',
       isVip: false, tags: [], totalVisits: 0, totalSpent: 0,
-      lastVisit: null, birthday: birthday || '', createdAt: new Date(),
+      lastVisit: null, birthday: isStr(birthday) ? birthday : '', createdAt: new Date(),
     };
 
     const result = await db.collection('customers').insertOne(customer);
     customer._id = result.insertedId;
-    res.status(201).json(customer);
+    res.status(201).json(apptOut(customer));
   } catch (err) {
     console.error('Create customer error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/businesses/:slug/customers/:id', authMiddleware, async (req, res) => {
+app.get('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const customer = await db.collection('customers').findOne({ _id: new ObjectId(req.params.id) });
+    const business = req.business;
+    const customer = await db.collection('customers').findOne(ownedFilter(business, req.params.id));
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
     const visits = await db.collection('appointments')
-      .find({ businessId: business._id, customerPhone: customer.phone, status: { $in: ['confirmed', 'completed'] } })
+      .find({ businessId: bizIdFilter(business), customerPhone: customer.phone, status: { $in: ['confirmed', 'completed'] } })
       .toArray();
     visits.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 
-    res.json({ ...customer, visits: visits.slice(0, 50) });
+    res.json({ ...apptOut(customer), visits: visits.slice(0, 50).map(apptOut) });
   } catch (err) {
     console.error('Get customer error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.put('/api/businesses/:slug/customers/:id', authMiddleware, async (req, res) => {
+app.put('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { name, phone, email, notes, isVip, tags, birthday } = req.body;
+    const { name, phone, email, notes, isVip, tags, birthday } = req.body || {};
     const update = {};
     if (name !== undefined) update.name = name;
     if (phone !== undefined) update.phone = phone;
     if (email !== undefined) update.email = email;
     if (notes !== undefined) update.notes = notes;
-    if (isVip !== undefined) update.isVip = isVip;
-    if (tags !== undefined) update.tags = tags;
+    if (isVip !== undefined) update.isVip = isVip === true;
+    if (tags !== undefined) update.tags = Array.isArray(tags) ? tags.filter(isStr) : [];
     if (birthday !== undefined) update.birthday = birthday;
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
 
     const result = await db.collection('customers').findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      ownedFilter(req.business, req.params.id),
       { $set: update },
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Customer not found' });
-    res.json(result);
+    res.json(apptOut(result));
   } catch (err) {
     console.error('Update customer error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -1153,77 +1578,66 @@ app.put('/api/businesses/:slug/customers/:id', authMiddleware, async (req, res) 
 
 // ============ TASKS (ALL PROTECTED) ============
 
-app.get('/api/businesses/:slug/tasks', authMiddleware, async (req, res) => {
+app.get('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const query = { businessId: business._id.toString() };
+    const query = { businessId: bizIdFilter(req.business) };
     if (req.query.filter === 'active') query.completed = false;
     else if (req.query.filter === 'completed') query.completed = true;
 
     const tasks = await db.collection('tasks').find(query).toArray();
     tasks.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    res.json(tasks);
+    res.json(tasks.map(apptOut));
   } catch (err) {
     console.error('List tasks error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.post('/api/businesses/:slug/tasks', authMiddleware, async (req, res) => {
+app.post('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { text, dueDate } = req.body;
-    if (!text) return res.status(400).json({ error: 'Text is required' });
+    const { text, dueDate } = req.body || {};
+    if (!isNonEmptyStr(text)) return res.status(400).json({ error: 'Text is required' });
 
     const task = {
-      businessId: business._id.toString(),
+      businessId: req.business._id.toString(),
       text, dueDate: dueDate || null,
       completed: false, completedAt: null, createdAt: new Date(),
     };
 
     const result = await db.collection('tasks').insertOne(task);
     task._id = result.insertedId;
-    res.status(201).json(task);
+    res.status(201).json(apptOut(task));
   } catch (err) {
     console.error('Create task error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.put('/api/businesses/:slug/tasks/:id', authMiddleware, async (req, res) => {
+app.put('/api/businesses/:slug/tasks/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { text, dueDate, completed } = req.body;
+    const { text, dueDate, completed } = req.body || {};
     const update = {};
     if (text !== undefined) update.text = text;
     if (dueDate !== undefined) update.dueDate = dueDate;
-    if (completed !== undefined) { update.completed = completed; update.completedAt = completed ? new Date() : null; }
+    if (completed !== undefined) { update.completed = completed === true; update.completedAt = completed === true ? new Date() : null; }
+    if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
 
     const result = await db.collection('tasks').findOneAndUpdate(
-      { _id: new ObjectId(req.params.id) },
+      ownedFilter(req.business, req.params.id),
       { $set: update },
       { returnDocument: 'after' }
     );
     if (!result) return res.status(404).json({ error: 'Task not found' });
-    res.json(result);
+    res.json(apptOut(result));
   } catch (err) {
     console.error('Update task error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.delete('/api/businesses/:slug/tasks/:id', authMiddleware, async (req, res) => {
+app.delete('/api/businesses/:slug/tasks/:id', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const result = await db.collection('tasks').deleteOne({ _id: new ObjectId(req.params.id) });
+    const result = await db.collection('tasks').deleteOne(ownedFilter(req.business, req.params.id));
     if (result.deletedCount === 0) return res.status(404).json({ error: 'Task not found' });
     res.json({ success: true });
   } catch (err) {
@@ -1232,18 +1646,14 @@ app.delete('/api/businesses/:slug/tasks/:id', authMiddleware, async (req, res) =
   }
 });
 
-// ============ STAFF (PROTECTED) ============
+// ============ STAFF ============
 
 // Get staff — PUBLIC (for booking flow)
 app.get('/api/businesses/:slug/staff', async (req, res) => {
   try {
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    const staff = (business.staff || []).filter(s => s.isActive !== false);
-    res.json(staff.map(s => ({
-      _id: s._id, name: s.name, role: s.role, services: s.services || [],
-      workingHours: s.workingHours || {}
-    })));
+    res.json((business.staff || []).filter(s => s.isActive !== false).map(publicStaff));
   } catch (err) {
     console.error('Get staff error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -1251,25 +1661,23 @@ app.get('/api/businesses/:slug/staff', async (req, res) => {
 });
 
 // Update staff — PROTECTED
-app.put('/api/businesses/:slug/staff', authMiddleware, async (req, res) => {
+app.put('/api/businesses/:slug/staff', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const { staff } = req.body;
+    const { staff } = req.body || {};
     if (!Array.isArray(staff)) return res.status(400).json({ error: 'staff must be an array' });
 
-    const staffWithIds = staff.map(s => ({
-      ...s,
-      _id: s._id ? new ObjectId(s._id) : new ObjectId()
-    }));
+    const staffWithIds = staff.filter(s => s && typeof s === 'object').map(s => {
+      const { id, ...rest } = s;
+      return { ...rest, _id: toObjectId(String(s._id || id || '')) || new ObjectId() };
+    });
 
     const result = await db.collection('businesses').findOneAndUpdate(
-      { slug: req.params.slug },
+      { _id: req.business._id },
       { $set: { staff: staffWithIds } },
       { returnDocument: 'after' }
     );
-    res.json(result);
+    if (!result) return res.status(404).json({ error: 'Business not found' });
+    res.json(normalizeBusiness(result));
   } catch (err) {
     console.error('Update staff error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -1280,106 +1688,73 @@ app.put('/api/businesses/:slug/staff', authMiddleware, async (req, res) => {
 
 app.get('/api/businesses/:slug/availability', async (req, res) => {
   try {
-    const { date, staffId, serviceId } = req.query;
+    const date = isStr(req.query.date) ? req.query.date : '';
+    const staffId = isStr(req.query.staffId) ? req.query.staffId : '';
+    const serviceId = isStr(req.query.serviceId) ? req.query.serviceId : '';
     if (!date) return res.status(400).json({ error: 'Date parameter required (YYYY-MM-DD)' });
+    if (!T.isValidYMD(date)) return res.status(400).json({ error: 'Invalid date (expected YYYY-MM-DD)' });
 
-    const sanitizedDate = sanitizeQuery(date);
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
 
-    const dayOfWeek = new Date(sanitizedDate + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' }).toLowerCase();
-    const businessHours = business.workingHours?.[dayOfWeek];
+    const tz = T.businessTz(business);
+    const now = T.nowInTz(tz);
+    const dayOfWeek = T.dayNameOf(date);
+    const closed = (message, extra = {}) => res.json({ date, dayOfWeek, available: false, slots: [], availableServices: [], availableStaff: [], message, ...extra });
 
-    if (!businessHours || !businessHours.enabled) {
-      return res.json({ date: sanitizedDate, available: false, slots: [], availableServices: [], message: 'Business closed on this day' });
-    }
+    if (date < now.date) return closed('Date is in the past', { reason: 'past' });
+    const bizHours = businessDayHours(business, dayOfWeek);
+    if (!bizHours) return closed('Business closed on this day', { reason: 'closed' });
+    const rawDay = business.workingHours[dayOfWeek];
 
-    // Determine effective working hours (staff hours override business hours)
-    let effectiveStart = businessHours.start;
-    let effectiveEnd = businessHours.end;
-    let staffMemberFound = null;
+    const service = serviceId ? findService(business, serviceId) : null;
+    if (serviceId && !service) return res.status(400).json({ error: 'Service not found' });
+    const svcKey = service ? serviceKey(service) : null;
+    if (svcKey && !perDayServiceAllowed(rawDay, svcKey)) return closed('Service not available on this day', { reason: 'service_unavailable_day' });
 
-    if (staffId && business.staff?.length > 0) {
-      staffMemberFound = business.staff.find(s => s._id?.toString() === sanitizeQuery(staffId));
-      if (staffMemberFound) {
-        const staffHours = staffMemberFound.workingHours?.[dayOfWeek];
-        if (!staffHours || !staffHours.enabled) {
-          return res.json({ date: sanitizedDate, available: false, slots: [], message: 'Staff member not available on this day' });
-        }
-        effectiveStart = staffHours.start;
-        effectiveEnd = staffHours.end;
-      }
-    }
+    const slotDuration = service && validDuration(service.duration) ? Number(service.duration) : 30;
+    const appts = await dayAppointments(business, date);
+    const staffAll = activeStaff(business);
 
-    // Per-day service availability
-    let availableServiceIds = null;
-    if (businessHours.serviceMode === 'custom' && Array.isArray(businessHours.enabledServices)) {
-      availableServiceIds = businessHours.enabledServices.map(id => id.toString());
-    }
-
-    // If serviceId provided, check it's available on this day
-    if (serviceId && availableServiceIds) {
-      if (!availableServiceIds.includes(sanitizeQuery(serviceId))) {
-        return res.json({ date: sanitizedDate, available: false, slots: [], message: 'Service not available on this day' });
-      }
-    }
-
-    // Also check if staff provides the requested service
-    if (serviceId && staffMemberFound && staffMemberFound.services?.length > 0) {
-      if (!staffMemberFound.services.includes(sanitizeQuery(serviceId)) &&
-          !staffMemberFound.services.some(sid => sid.toString() === sanitizeQuery(serviceId))) {
-        return res.json({ date: sanitizedDate, available: false, slots: [], message: 'Staff member does not provide this service' });
-      }
-    }
-
-    // Build appointment query — filter by staffId if provided
-    const aptQuery = { businessId: business._id, date: sanitizedDate, status: { $nin: ['cancelled'] } };
-    if (staffId) aptQuery.staffId = sanitizeQuery(staffId);
-
-    const appointments = await db.collection('appointments')
-      .find(aptQuery)
-      .toArray();
-
-    const [startH, startM] = effectiveStart.split(':').map(Number);
-    const [endH, endM] = effectiveEnd.split(':').map(Number);
-    const startMinutes = startH * 60 + startM;
-    const endMinutes = endH * 60 + endM;
-    
-    // Use service duration for slot intervals, default 30
-    let slotDuration = 30;
-    if (serviceId) {
-      const svc = (business.services || []).find(s => 
-        s._id?.toString() === serviceId || s.name === serviceId
-      );
-      if (svc && svc.duration) slotDuration = svc.duration;
+    let staffMember = null;
+    let window = { start: bizHours.start, end: bizHours.end };
+    let eligible = [];
+    if (staffId) {
+      staffMember = (business.staff || []).find(s => s && s._id && s._id.toString() === staffId && s.isActive !== false);
+      if (!staffMember) return res.status(400).json({ error: 'Staff member not found' });
+      const h = staffDayHours(staffMember, dayOfWeek, bizHours);
+      if (!h) return closed('Staff member not available on this day', { reason: 'staff_day_off' });
+      if (svcKey && !staffProvides(staffMember, svcKey)) return closed('Staff member does not provide this service', { reason: 'staff_service' });
+      window = { start: Math.max(h.start, bizHours.start), end: Math.min(h.end, bizHours.end) };
+    } else if (staffAll.length > 0) {
+      eligible = staffAll.filter(sm => (!svcKey || staffProvides(sm, svcKey)) && staffDayHours(sm, dayOfWeek, bizHours));
+      if (!eligible.length) return closed('No staff available on this day', { reason: 'no_staff' });
     }
 
     const slots = [];
-    for (let m = startMinutes; m + slotDuration <= endMinutes; m += slotDuration) {
-      const slotStart = `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`;
-      const slotEnd = `${String(Math.floor((m + slotDuration) / 60)).padStart(2, '0')}:${String((m + slotDuration) % 60).padStart(2, '0')}`;
-      const isBooked = appointments.some(apt => apt.startTime < slotEnd && apt.endTime > slotStart);
-      slots.push({ start: slotStart, end: slotEnd, available: !isBooked });
+    for (let m = window.start; m + slotDuration <= window.end; m += slotDuration) {
+      const start = m, end = m + slotDuration;
+      let available;
+      if (date === now.date && start <= now.minutes) available = false;
+      else if (staffMember) available = !appts.some(a => a.staffId && String(a.staffId) === staffId && overlaps(a, start, end));
+      else if (eligible.length) available = freeStaff(eligible, appts, start, end, { dayName: dayOfWeek, bizHours, enforceHours: true }).length > 0;
+      else available = !appts.some(a => overlaps(a, start, end));
+      slots.push({ start: T.minToHM(start), end: T.minToHM(end), available });
     }
 
     // Build available services for this day
-    const availableServices = availableServiceIds
-      ? (business.services || []).filter(s => availableServiceIds.includes(s._id?.toString())).map(s => ({ _id: s._id, name: s.name, duration: s.duration, price: s.price }))
-      : (business.services || []).map(s => ({ _id: s._id, name: s.name, duration: s.duration, price: s.price }));
+    const allowedIds = rawDay && rawDay.serviceMode === 'custom' && Array.isArray(rawDay.enabledServices)
+      ? rawDay.enabledServices.map(String) : null;
+    const availableServices = (business.services || [])
+      .filter(s => !allowedIds || allowedIds.includes(serviceKey(s)))
+      .map(publicService);
 
     // Build available staff for this day + service
-    const availableStaff = (business.staff || []).filter(s => {
-      if (s.isActive === false) return false;
-      const sh = s.workingHours?.[dayOfWeek];
-      if (sh && !sh.enabled) return false;
-      if (serviceId && s.services?.length > 0) {
-        const sid = sanitizeQuery(serviceId);
-        if (!s.services.includes(sid) && !s.services.some(id => id.toString() === sid)) return false;
-      }
-      return true;
-    }).map(s => ({ _id: s._id, name: s.name, role: s.role }));
+    const availableStaff = staffAll
+      .filter(s => staffDayHours(s, dayOfWeek, bizHours) && (!svcKey || staffProvides(s, svcKey)))
+      .map(s => ({ _id: s._id, id: s._id.toString(), name: s.name, role: s.role }));
 
-    res.json({ date: sanitizedDate, dayOfWeek, available: true, slots, availableServices, availableStaff });
+    res.json({ date, dayOfWeek, available: slots.some(s => s.available), slots, availableServices, availableStaff });
   } catch (err) {
     console.error('Availability error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -1388,28 +1763,26 @@ app.get('/api/businesses/:slug/availability', async (req, res) => {
 
 // ============ STATS (PROTECTED) ============
 
-app.get('/api/businesses/:slug/stats', authMiddleware, async (req, res) => {
+app.get('/api/businesses/:slug/stats', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-
-    const bid = business._id;
-    const bidStr = business._id.toString();
+    const business = req.business;
+    const bid = bizIdFilter(business);
     const now = new Date();
-    const weekAgoStr = new Date(now - 7 * 86400000).toISOString().split('T')[0];
+    const weekAgoStr = T.addDays(T.todayInTz(T.businessTz(business)), -7);
 
     const [weekAppts, weekCancelled, weekCustomers] = await Promise.all([
-      db.collection('appointments').countDocuments({ businessId: { $in: [bid, bidStr] }, date: { $gte: weekAgoStr } }),
-      db.collection('appointments').countDocuments({ businessId: { $in: [bid, bidStr] }, status: 'cancelled', date: { $gte: weekAgoStr } }),
-      db.collection('customers').countDocuments({ businessId: { $in: [bid, bidStr] }, createdAt: { $gte: new Date(now - 7 * 86400000) } })
+      db.collection('appointments').countDocuments({ businessId: bid, date: { $gte: weekAgoStr } }),
+      db.collection('appointments').countDocuments({ businessId: bid, status: 'cancelled', date: { $gte: weekAgoStr } }),
+      db.collection('customers').countDocuments({ businessId: bid, createdAt: { $gte: new Date(now - 7 * 86400000) } })
     ]);
 
     const confirmed = await db.collection('appointments').find({
-      businessId: { $in: [bid, bidStr] }, status: 'confirmed', date: { $gte: weekAgoStr }
+      businessId: bid, status: 'confirmed', date: { $gte: weekAgoStr }
     }).toArray();
     let revenue = 0;
     for (const appt of confirmed) {
-      const svc = business.services?.find(s => s._id?.toString() === appt.serviceId || s.name === appt.serviceName);
+      if (typeof appt.price === 'number') { revenue += appt.price; continue; }
+      const svc = business.services?.find(s => s._id?.toString() === String(appt.serviceId) || s.name === appt.serviceName);
       if (svc) revenue += svc.price || 0;
     }
 
@@ -1425,31 +1798,33 @@ app.get('/api/businesses/:slug/stats', authMiddleware, async (req, res) => {
 });
 
 // Extended stats with monthly data and busiest day
-app.get('/api/businesses/:slug/stats/extended', authMiddleware, async (req, res) => {
+app.get('/api/businesses/:slug/stats/extended', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business || business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Not authorized' });
-    const bid = business._id;
-    const bidStr = business._id.toString();
+    const business = req.business;
+    const bid = bizIdFilter(business);
     const now = new Date();
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
-    const weekAgoStr = new Date(now - 7 * 86400000).toISOString().split('T')[0];
+    const today = T.todayInTz(T.businessTz(business));
+    const monthStart = today.slice(0, 8) + '01';
 
     const monthAppts = await db.collection('appointments').find({
-      businessId: { $in: [bid, bidStr] }, date: { $gte: monthStart }, status: { $ne: 'cancelled' }
+      businessId: bid, date: { $gte: monthStart }, status: { $ne: 'cancelled' }
     }).toArray();
 
     let monthRevenue = 0;
     const dayCount = [0, 0, 0, 0, 0, 0, 0]; // Sun-Sat
     for (const a of monthAppts) {
-      const svc = business.services?.find(s => s._id?.toString() === a.serviceId || s.name === a.serviceName);
-      if (svc && a.status === 'confirmed') monthRevenue += svc.price || 0;
-      const d = new Date(a.date + 'T00:00:00');
-      if (!isNaN(d.getTime())) dayCount[d.getDay()]++;
+      if (a.status === 'confirmed') {
+        if (typeof a.price === 'number') monthRevenue += a.price;
+        else {
+          const svc = business.services?.find(s => s._id?.toString() === String(a.serviceId) || s.name === a.serviceName);
+          if (svc) monthRevenue += svc.price || 0;
+        }
+      }
+      if (T.isValidYMD(a.date)) dayCount[T.DAY_NAMES.indexOf(T.dayNameOf(a.date))]++;
     }
 
     const monthCustomers = await db.collection('customers').countDocuments({
-      businessId: { $in: [bid, bidStr] }, createdAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
+      businessId: bid, createdAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
     });
 
     res.json({
@@ -1465,18 +1840,13 @@ app.get('/api/businesses/:slug/stats/extended', authMiddleware, async (req, res)
 });
 
 // ============ REMINDERS API ============
+// Scheduler endpoints require the X-Cron-Secret header (= REMINDER_CRON_SECRET app setting).
+// The old open /api/reminders/send relay has been removed.
 
-const reminderService = require('./reminder-service.js');
-
-// Start reminder loop if Twilio is configured (checks every 2 minutes)
-if (process.env.TWILIO_ACCOUNT_SID) {
-  reminderService.startReminderLoop(120000, `http://localhost:${process.env.PORT || 3000}`);
-}
-
-// Manually trigger reminder processing
-app.post('/api/reminders/process', async (req, res) => {
+// Run one scheduler pass now (push + customer reminders when a provider is configured)
+app.post('/api/reminders/process', requireCronSecret, async (req, res) => {
   try {
-    const result = await reminderService.processReminders(`http://localhost:${process.env.PORT || 3000}`);
+    const result = await reminders.runOnce({ db, notifyBusiness, reminderService });
     res.json(result);
   } catch (err) {
     console.error('Reminders process error:', err);
@@ -1484,116 +1854,33 @@ app.post('/api/reminders/process', async (req, res) => {
   }
 });
 
-// Send a single reminder (for testing or manual sends)
-app.post('/api/reminders/send', async (req, res) => {
+// External cron (VM): returns due customer reminders and fires owner push reminders.
+app.post('/api/reminders/check', requireCronSecret, async (req, res) => {
   try {
-    const { phone, message, channel } = req.body;
-    if (!phone || !message) return res.status(400).json({ error: 'Missing phone or message' });
-    const result = await reminderService.sendReminder(phone, message, channel);
-    res.json(result);
-  } catch (err) {
-    console.error('Reminder send error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Check for pending reminders (called by cron from Johnny's VM).
-// WhatsApp reminders use reminderSettings + reminders.* flags.
-// Push reminders for 24h + 1h always fire (independent pushReminders.* flags).
-app.post('/api/reminders/check', async (req, res) => {
-  try {
-    const REMINDER_INTERVALS = [
-      { minutes: 1440, key: '1day' },   // 24h
-      { minutes: 60,   key: '1hour' },  // 1h — push (WhatsApp only if enabled in settings)
-      { minutes: 120,  key: '2hours' },
-      { minutes: 30,   key: '30min' },
-    ];
-    const PUSH_REMINDER_KEYS = new Set(['1day', '1hour']);
-
-    const businesses = await db.collection('businesses').find({ isActive: { $ne: false } }).toArray();
-    const remindersToSend = [];
-
-    for (const biz of businesses) {
-      const settings = biz.reminderSettings || { '1day': true, '2hours': true, '30min': false };
-
-      for (const interval of REMINDER_INTERVALS) {
-        const wantsWhatsApp = !!settings[interval.key];
-        const wantsPush = PUSH_REMINDER_KEYS.has(interval.key);
-        if (!wantsWhatsApp && !wantsPush) continue;
-
-        const targetTime = new Date(Date.now() + interval.minutes * 60000);
-        const targetDate = targetTime.toISOString().split('T')[0];
-        const targetHour = targetTime.toTimeString().slice(0, 5);
-
-        // Match both string and ObjectId businessId (historical inconsistency)
-        const appointments = await db.collection('appointments').find({
-          businessId: { $in: [biz._id.toString(), biz._id] },
-          date: targetDate,
-          startTime: targetHour,
-          status: { $in: ['confirmed', 'pending'] },
-        }).toArray();
-
-        for (const appt of appointments) {
-          const alreadyWa = appt.reminders && appt.reminders[interval.key] === true;
-          const alreadyPush = appt.pushReminders && appt.pushReminders[interval.key] === true;
-
-          if (wantsWhatsApp && !alreadyWa) {
-            const template = settings.template || 'שלום {customer_name}, תזכורת: יש לך תור ל{service} ב{date} בשעה {time} ב{business_name}. לאישור השב 1, לביטול השב 2.';
-            const message = template
-              .replace(/{customer_name}/g, appt.customerName || '')
-              .replace(/{service}/g, appt.serviceName || '')
-              .replace(/{date}/g, appt.date || '')
-              .replace(/{time}/g, appt.startTime || '')
-              .replace(/{business_name}/g, biz.name || '');
-
-            remindersToSend.push({
-              appointmentId: appt._id.toString(),
-              businessId: biz._id.toString(),
-              customerPhone: appt.customerPhone,
-              customerName: appt.customerName,
-              message,
-              intervalKey: interval.key,
-            });
-          }
-
-          if (wantsPush && !alreadyPush) {
-            void notifyBusiness(biz._id, {
-              titleKey: 'reminder_title',
-              bodyKey: 'reminder_body',
-              payload: {
-                customerName: appt.customerName,
-                serviceName: appt.serviceName,
-                date: appt.date,
-                time: appt.startTime,
-              },
-              url: '/(dashboard)/appointments',
-            });
-            await db.collection('appointments').updateOne(
-              { _id: appt._id },
-              { $set: { [`pushReminders.${interval.key}`]: true } }
-            );
-          }
-        }
-      }
-    }
-
-    res.json({ reminders: remindersToSend, count: remindersToSend.length });
+    const due = await reminders.findDue(db);
+    await reminders.sendPushes(db, due, notifyBusiness);
+    const list = reminders.toCheckPayload(due);
+    res.json({ reminders: list, count: list.length });
   } catch (err) {
     console.error('Reminders check error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Mark reminder as sent
-app.post('/api/reminders/mark-sent', async (req, res) => {
+// Mark reminder as sent (external cron)
+app.post('/api/reminders/mark-sent', requireCronSecret, async (req, res) => {
   try {
-    const { appointmentId, intervalKey } = req.body;
+    const { appointmentId, intervalKey } = req.body || {};
     if (!appointmentId || !intervalKey) return res.status(400).json({ error: 'Missing appointmentId or intervalKey' });
+    const oid = toObjectId(String(appointmentId));
+    if (!oid) return res.status(400).json({ error: 'Invalid appointmentId' });
+    if (!reminders.VALID_KEYS.has(intervalKey)) return res.status(400).json({ error: 'Invalid intervalKey' });
 
-    await db.collection('appointments').updateOne(
-      { _id: new ObjectId(appointmentId) },
+    const r = await db.collection('appointments').updateOne(
+      { _id: oid },
       { $set: { [`reminders.${intervalKey}`]: true } }
     );
+    if (r.matchedCount === 0) return res.status(404).json({ error: 'Appointment not found' });
     res.json({ success: true });
   } catch (err) {
     console.error('Mark reminder error:', err);
@@ -1602,14 +1889,10 @@ app.post('/api/reminders/mark-sent', async (req, res) => {
 });
 
 // Get reminder history for a business
-app.get('/api/businesses/:slug/reminders', authMiddleware, async (req, res) => {
+app.get('/api/businesses/:slug/reminders', requireOwner, async (req, res) => {
   try {
-    const business = await getBusinessBySlug(req.params.slug);
-    if (!business) return res.status(404).json({ error: 'Business not found' });
-    if (business._id.toString() !== req.businessId) return res.status(403).json({ error: 'Forbidden' });
-
     const appointments = await db.collection('appointments').find({
-      businessId: business._id.toString(),
+      businessId: bizIdFilter(req.business),
       'reminders': { $exists: true },
     }).sort({ date: -1 }).limit(50).toArray();
 
@@ -1631,9 +1914,6 @@ app.get('/api/businesses/:slug/reminders', authMiddleware, async (req, res) => {
 
 // ============ ADMIN ============
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'snaptor2026';
-const ADMIN_JWT_SECRET = JWT_SECRET + '-admin';
-
 function adminAuth(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token' });
@@ -1644,10 +1924,16 @@ function adminAuth(req, res, next) {
   } catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
-app.post('/api/admin/login', (req, res) => {
-  const { password } = req.body;
-  if (password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password' });
-  const token = jwt.sign({ admin: true }, ADMIN_JWT_SECRET, { expiresIn: '24h' });
+app.post('/api/admin/login', adminLoginLimiter, (req, res) => {
+  if (!ADMIN_PASSWORD) return res.status(503).json({ error: 'Admin login disabled (ADMIN_PASSWORD not set)' });
+  const { password } = req.body || {};
+  const ok = isStr(password) && crypto.timingSafeEqual(sha256(password), sha256(ADMIN_PASSWORD));
+  if (!ok) {
+    console.warn(`[admin] failed login ip=${clientIp(req)}`);
+    return res.status(401).json({ error: 'Wrong password' });
+  }
+  console.log(`[admin] login ip=${clientIp(req)}`);
+  const token = jwt.sign({ admin: true }, ADMIN_JWT_SECRET, { expiresIn: '12h' });
   res.json({ token });
 });
 
@@ -1656,7 +1942,7 @@ app.get('/api/admin/data', adminAuth, async (req, res) => {
     const [businesses, customers, appointments] = await Promise.all([
       db.collection('businesses').find({}).toArray(),
       db.collection('customers').find({}).toArray(),
-      db.collection('appointments').find({}).toArray().then(a => a.sort((x,y) => (y.date+y.startTime).localeCompare(x.date+x.startTime)).slice(0, 200)),
+      db.collection('appointments').find({}).toArray().then(a => a.sort((x,y) => (String(y.date)+y.startTime).localeCompare(String(x.date)+x.startTime)).slice(0, 200)),
     ]);
     // Convert ObjectIds to strings for frontend matching
     businesses.forEach(b => { b._id = b._id.toString(); });
@@ -1670,20 +1956,22 @@ app.get('/api/admin/data', adminAuth, async (req, res) => {
 
 app.put('/api/admin/businesses/:id', adminAuth, async (req, res) => {
   try {
-    const bid = req.params.id;
-    const { name, phone, type, slug } = req.body;
+    const bid = new ObjectId(req.params.id);
+    const { name, phone, type, slug } = req.body || {};
     const update = {};
     if (name !== undefined) update.name = name;
     if (phone !== undefined) update.phone = phone;
     if (type !== undefined) update.type = type;
     if (slug !== undefined) {
+      if (!isNonEmptyStr(slug)) return res.status(400).json({ error: 'Invalid slug' });
       const s = slug.toLowerCase().trim();
-      const existing = await db.collection('businesses').findOne({ slug: s, _id: { $ne: new ObjectId(bid) } });
+      const existing = await db.collection('businesses').findOne({ slug: s, _id: { $ne: bid } });
       if (existing) return res.status(400).json({ error: 'Slug already exists' });
       update.slug = s;
     }
     if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
-    await db.collection('businesses').updateOne({ _id: new ObjectId(bid) }, { $set: update });
+    const r = await db.collection('businesses').updateOne({ _id: bid }, { $set: update });
+    if (r.matchedCount === 0) return res.status(404).json({ error: 'Business not found' });
     res.json({ success: true });
   } catch (err) {
     console.error('Admin edit business error:', err);
@@ -1693,11 +1981,11 @@ app.put('/api/admin/businesses/:id', adminAuth, async (req, res) => {
 
 app.patch('/api/admin/businesses/:id/toggle', adminAuth, async (req, res) => {
   try {
-    const bid = req.params.id;
-    const business = await db.collection('businesses').findOne({ _id: new ObjectId(bid) });
+    const bid = new ObjectId(req.params.id);
+    const business = await db.collection('businesses').findOne({ _id: bid });
     if (!business) return res.status(404).json({ error: 'Business not found' });
     const newState = !(business.isActive !== false);
-    await db.collection('businesses').updateOne({ _id: new ObjectId(bid) }, { $set: { isActive: newState } });
+    await db.collection('businesses').updateOne({ _id: bid }, { $set: { isActive: newState } });
     res.json({ success: true, isActive: newState });
   } catch (err) {
     console.error('Admin toggle business error:', err);
@@ -1708,15 +1996,16 @@ app.patch('/api/admin/businesses/:id/toggle', adminAuth, async (req, res) => {
 app.delete('/api/admin/businesses/:id', adminAuth, async (req, res) => {
   try {
     const bid = req.params.id;
-    const business = await db.collection('businesses').findOne({ _id: new ObjectId(bid) });
-    if (!business) return res.status(404).json({ error: 'Business not found' });
     const bidObj = new ObjectId(bid);
+    const business = await db.collection('businesses').findOne({ _id: bidObj });
+    if (!business) return res.status(404).json({ error: 'Business not found' });
     await Promise.all([
       db.collection('businesses').deleteOne({ _id: bidObj }),
       db.collection('appointments').deleteMany({ businessId: { $in: [bidObj, bid] } }),
       db.collection('customers').deleteMany({ businessId: { $in: [bidObj, bid] } }),
       db.collection('tasks').deleteMany({ businessId: { $in: [bidObj, bid] } }),
       db.collection('announcements').deleteMany({ businessId: { $in: [bidObj, bid] } }),
+      db.collection('push_tokens').deleteMany({ business_id: bid }),
     ]);
     res.json({ success: true, deleted: business.slug });
   } catch (err) {
@@ -1745,17 +2034,53 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// Unknown API routes → JSON 404 (instead of hanging)
+app.all('/api/*', (req, res) => res.status(404).json({ error: 'Not found' }));
+
 // SPA fallback — must be LAST
 app.get('*', (req, res) => {
-  if (req.path.startsWith('/api/') || req.path === '/admin' || req.path.startsWith('/book/')) return;
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Start
-const PORT = process.env.PORT || 3000;
-connectDB().then(() => {
-  app.listen(PORT, () => console.log(`PickTime running on port ${PORT}`));
-}).catch(err => {
-  console.error('Failed to connect to MongoDB:', err);
-  process.exit(1);
+// Last-resort error handler (e.g. DB errors thrown inside middleware)
+app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
+  if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON' });
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
+
+// ============ START ============
+
+let scheduler = null;
+function startBackground() {
+  const mode = String(process.env.REMINDER_SCHEDULER || (IS_PROD ? 'on' : 'off')).toLowerCase();
+  if (mode !== 'off' && mode !== 'false' && mode !== '0') {
+    scheduler = reminders.startScheduler({ getDb: () => db, notifyBusiness, reminderService, intervalMs: intEnv('REMINDER_INTERVAL_MS', 60000) });
+  }
+  if (otpFlagOn() && !otpSender.configured) {
+    console.error('[auth] AUTH_OTP_REQUIRED=true but no OTP provider is configured — OTP is NOT enforced (legacy phone login stays on). See lib/otp-sender.js.');
+  }
+  console.log(`[auth] login mode: ${otpEnabled() ? `OTP via ${otpSender.name}` : 'legacy phone-only (OTP off)'}; token TTL ${TOKEN_TTL}`);
+  if (!process.env.REMINDER_CRON_SECRET) console.warn('[reminders] REMINDER_CRON_SECRET not set — /api/reminders/* endpoints are disabled');
+  if (!ADMIN_PASSWORD) console.warn('[admin] ADMIN_PASSWORD not set — admin login disabled');
+}
+
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  connectDB().then(() => {
+    app.listen(PORT, () => console.log(`PickTime running on port ${PORT}`));
+    startBackground();
+  }).catch(err => {
+    console.error('Failed to connect to MongoDB:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  app, connectDB, client,
+  getDb: () => db,
+  setOtpSender: (s) => { otpSender = s; },
+  getOtpSender: () => otpSender,
+  JWT_SECRET,
+  _internals: { phoneKey, phoneVariants, toObjectId, createAppointment },
+};
