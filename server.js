@@ -806,7 +806,7 @@ const RESERVED_SLUGS = new Set([
   'admin', 'api', 'app', 'login', 'logout', 'register', 'signup', 'signin', 'auth', 'account',
   'settings', 'dashboard', 'privacy', 'support', 'terms', 'help', 'about', 'contact', 'pricing',
   'book', 'booking', 'manage', 'staff', 'services', 'customers', 'customer-detail', 'appointments',
-  'tasks', 'groups', 'reminders', 'notifications', 'index', 'home', 'new', 'not-found',
+  'tasks', 'groups', 'reminders', 'notifications', 'index', 'home', 'new', 'more', 'not-found',
   '_expo', '_sitemap', 'assets', 'static', 'public', 'js', 'css', 'img', 'images', 'fonts',
   'favicon.ico', 'robots.txt', 'sitemap.xml', 'manifest.json', 'health', 'status',
   'www', 'mail', 'snaptor', 'picktime', 'test', 'demo', 'null', 'undefined',
@@ -1545,16 +1545,36 @@ app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) 
 app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res) => {
   try {
     const business = req.business;
-    const { status, notes, confirmationNote, cancellationReason } = req.body || {};
+    const { status, notes, confirmationNote, cancellationReason, customerName, customerPhone } = req.body || {};
     const update = {};
     if (status !== undefined) {
       if (!APPOINTMENT_STATUSES.includes(status)) return res.status(400).json({ error: 'Invalid status' });
       update.status = status;
     }
-    if (notes !== undefined) update.notes = notes;
+    // P4-A1: the owner can correct the customer's name / phone and notes from the detail sheet.
+    if (customerName !== undefined) {
+      if (!isNonEmptyStr(customerName)) return res.status(400).json({ error: 'Customer name is required', code: 'missing_fields' });
+      update.customerName = customerName.trim().slice(0, 200);
+    }
+    if (customerPhone !== undefined) {
+      if (!isStr(customerPhone) || !isValidIsraeliPhone(customerPhone)) return res.status(400).json({ error: 'Invalid phone number format', code: 'invalid_phone' });
+      update.customerPhone = customerPhone.trim();
+    }
+    if (notes !== undefined) { if (!isStr(notes)) return res.status(400).json({ error: 'Invalid notes' }); update.notes = notes.slice(0, 2000); }
     if (confirmationNote !== undefined) update.confirmationNote = confirmationNote;
     if (cancellationReason !== undefined) update.cancellationReason = cancellationReason;
     if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+
+    // P4-A1: no-show / completed only once the appointment has started.
+    if (update.status === 'no_show' || update.status === 'completed') {
+      const cur = await db.collection('appointments').findOne(ownedFilter(business, req.params.id));
+      if (!cur) return res.status(404).json({ error: 'Appointment not found' });
+      const now = T.nowInTz(T.businessTz(business));
+      const startMin = T.isValidHM(cur.startTime) ? T.hmToMin(cur.startTime) : 0;
+      if (cur.date > now.date || (cur.date === now.date && startMin > now.minutes)) {
+        return res.status(400).json({ error: 'The appointment has not started yet', code: 'not_started' });
+      }
+    }
 
     // Re-activating a cancelled/declined appointment (e.g. "Undo" in the dashboard, H-14/M-16)
     // must not create a double booking if the slot was taken in the meantime.
@@ -1590,7 +1610,7 @@ app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res)
       }).catch(() => {});
     }
 
-    res.json(apptOut(result));
+    res.json(apptOutFor(business)(result));
   } catch (err) {
     console.error('Update appointment error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -1627,6 +1647,54 @@ app.delete('/api/businesses/:slug/appointments/:id', requireOwner, async (req, r
     res.json({ success: true, appointment: apptOut(result) });
   } catch (err) {
     console.error('Cancel appointment error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Owner moves an appointment (P4-A1): new date/time (and optionally staff), same service.
+// Owner rules: may be outside hours, not in the past, never a double booking.
+app.post('/api/businesses/:slug/appointments/:id/move', requireOwner, async (req, res) => {
+  try {
+    const business = req.business;
+    const { date, startTime } = req.body || {};
+    const cur = await db.collection('appointments').findOne(ownedFilter(business, req.params.id));
+    if (!cur) return res.status(404).json({ error: 'Appointment not found' });
+    if (INACTIVE_STATUSES.includes(cur.status) || cur.status === 'no_show' || cur.status === 'completed') {
+      return res.status(400).json({ error: 'This appointment can no longer be moved', code: 'not_movable' });
+    }
+    const staffId = req.body && req.body.staffId !== undefined ? req.body.staffId : (cur.staffId || '');
+    let end, staffMember = null, endTime, duration;
+    const svc = findService(business, String(cur.serviceId || ''));
+    if (svc) {
+      const r = await checkSlot(business, { serviceId: String(cur.serviceId), staffId, date, startTime }, { isOwner: true, excludeId: cur._id });
+      end = r.end; endTime = r.endTime; staffMember = r.staffMember; duration = r.duration;
+    } else {
+      // service deleted since booking: keep the stored length, check conflicts by hand
+      if (!T.isValidYMD(date) || !T.isValidHM(startTime)) throw new BookingError(400, 'Invalid date/time', 'invalid_date');
+      duration = apptDuration(business, cur);
+      const start = T.hmToMin(startTime); end = start + duration;
+      if (end > 24 * 60) throw new BookingError(400, 'Appointment must end by midnight', 'outside_hours');
+      if (date < T.nowInTz(T.businessTz(business)).date) throw new BookingError(400, 'Cannot book a date in the past', 'past');
+      const others = await dayAppointments(business, date, cur._id);
+      if (others.some(a => (cur.staffId ? (!a.staffId || String(a.staffId) === String(cur.staffId)) : true) && overlaps(a, start, end))) {
+        throw new BookingError(409, 'Time slot already booked', 'conflict');
+      }
+      endTime = T.minToHM(end);
+    }
+    const set = {
+      date, startTime, endTime, duration,
+      movedFrom: { date: cur.date, startTime: cur.startTime, at: new Date() },
+    };
+    if (staffMember) { set.staffId = staffMember._id.toString(); set.staffName = staffMember.name || ''; }
+    else if (svc && staffId === '') { set.staffId = ''; set.staffName = ''; }
+    // a pending reschedule request is superseded by the owner's move
+    if (cur.status === 'reschedule_requested') { set.status = 'confirmed'; set['rescheduleRequest.status'] = 'superseded'; }
+    // reminders already sent were for the old time; send them again for the new one
+    const result = await db.collection('appointments').findOneAndUpdate(ownedFilter(business, req.params.id), { $set: set, $unset: { reminders: '', pushReminders: '' } }, { returnDocument: 'after' });
+    res.json(apptOutFor(business)(result));
+  } catch (err) {
+    if (err instanceof BookingError) return res.status(err.status).json({ error: err.message, code: err.code });
+    console.error('Move appointment error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2055,11 +2123,12 @@ app.get('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) =>
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
     const visits = await db.collection('appointments')
-      .find({ businessId: bizIdFilter(business), customerPhone: customer.phone, status: { $in: ['confirmed', 'completed'] } })
+      .find({ businessId: bizIdFilter(business), customerPhone: customer.phone })
       .toArray();
-    visits.sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+    // P4-A1: full history (every status, newest first) so each row can open the appointment sheet.
+    visits.sort((a, b) => `${b.date || ''} ${b.startTime || ''}`.localeCompare(`${a.date || ''} ${a.startTime || ''}`));
 
-    res.json({ ...apptOut(customer), visits: visits.slice(0, 50).map(apptOut) });
+    res.json({ ...apptOut(customer), visits: visits.slice(0, 50).map(apptOutFor(business)) });
   } catch (err) {
     console.error('Get customer error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -2306,7 +2375,7 @@ app.get('/api/businesses/:slug/stats', requireOwner, async (req, res) => {
       db.collection('appointments').find({ businessId: bid, date: { $gte: weekFrom, $lte: weekTo } }).toArray(),
       db.collection('customers').countDocuments({ businessId: bid, createdAt: { $gte: new Date(weekStartMs) } }),
     ]);
-    const inactive = (a) => a.status === 'cancelled' || a.status === 'declined';
+    const inactive = (a) => a.status === 'cancelled' || a.status === 'declined' || a.status === 'no_show';
     const active = weekAppts.filter(a => !inactive(a));
     const revenueOf = (list) => list.filter(a => REVENUE_STATUSES.includes(a.status)).reduce((sum, a) => sum + apptPrice(business, a), 0);
     const todayActive = active.filter(a => a.date === today);
@@ -2316,6 +2385,7 @@ app.get('/api/businesses/:slug/stats', requireOwner, async (req, res) => {
       weekFrom, weekTo, today,
       weekAppointments: active.length,
       weekCancelled: cancelled,
+      weekNoShows: weekAppts.filter(a => a.status === 'no_show').length,
       cancellationRate: weekAppts.length > 0 ? Math.round((cancelled / weekAppts.length) * 100) : 0,
       weekRevenue: revenueOf(active),
       todayAppointments: todayActive.length,
@@ -2343,7 +2413,7 @@ app.get('/api/businesses/:slug/stats/extended', requireOwner, async (req, res) =
     let monthRevenue = 0;
     const dayCount = [0, 0, 0, 0, 0, 0, 0]; // Sun-Sat
     for (const a of monthAppts) {
-      if (a.status === 'declined') continue;
+      if (a.status === 'declined' || a.status === 'no_show') continue;
       if (REVENUE_STATUSES.includes(a.status)) monthRevenue += apptPrice(business, a);
       if (T.isValidYMD(a.date)) dayCount[T.DAY_NAMES.indexOf(T.dayNameOf(a.date))]++;
     }
@@ -2353,7 +2423,8 @@ app.get('/api/businesses/:slug/stats/extended', requireOwner, async (req, res) =
     });
 
     res.json({
-      monthAppointments: monthAppts.filter(a => a.status !== 'declined').length,
+      monthAppointments: monthAppts.filter(a => a.status !== 'declined' && a.status !== 'no_show').length,
+      monthNoShows: monthAppts.filter(a => a.status === 'no_show').length,
       monthRevenue,
       monthNewCustomers: monthCustomers,
       busiestDayData: dayCount, // [Sun, Mon, Tue, Wed, Thu, Fri, Sat]
