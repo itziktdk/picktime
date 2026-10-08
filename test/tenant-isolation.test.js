@@ -74,6 +74,7 @@ const slugRoutes = () => [
   ['put', `/api/businesses/${A.slug}/services/${ids.svc}`, { price: 1 }],
   ['delete', `/api/businesses/${A.slug}/services/${ids.svc}`, {}],
   ['put', `/api/businesses/${A.slug}/staff`, { staff: [] }],
+  ['get', `/api/businesses/${A.slug}/staff/all`, null],
   ['get', `/api/businesses/${A.slug}/stats`, null],
   ['get', `/api/businesses/${A.slug}/stats/extended`, null],
   ['get', `/api/businesses/${A.slug}/reminders`, null],

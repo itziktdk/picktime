@@ -887,7 +887,9 @@ function cleanStaffList(list, existing) {
     out.services = (Array.isArray(services) ? services : []).filter(v => typeof v === 'string').map(String).slice(0, 200);
     if (Array.isArray(s.workingDays)) out.workingDays = s.workingDays.filter(v => (Number.isInteger(v) && v >= 0 && v <= 6) || (isStr(v) && v.length <= 10)).slice(0, 7);
     else if (Array.isArray(prev.workingDays)) out.workingDays = prev.workingDays;
-    if (s.workingHours !== undefined && s.workingHours !== null) out.workingHours = cleanWorkingHours(s.workingHours, prev.workingHours || {});
+    // workingHours: object = set (merged per day), null = clear (follow the business hours), omitted = keep.
+    if (s.workingHours === null) { /* cleared */ }
+    else if (s.workingHours !== undefined) out.workingHours = cleanWorkingHours(s.workingHours, prev.workingHours || {});
     else if (prev.workingHours) out.workingHours = prev.workingHours;
     return out;
   });
@@ -1447,6 +1449,28 @@ function apptOut(a) {
   return { ...rest, id: a._id.toString() };
 }
 
+/** M-13: older appointments have no duration/price; derive them (end − start, the service price). */
+function serviceOfAppt(business, a) {
+  const svcs = (business && business.services) || [];
+  return svcs.find(s => s && s._id && String(s._id) === String(a.serviceId)) || svcs.find(s => s && s.name && s.name === a.serviceName) || null;
+}
+function apptDuration(business, a) {
+  if (validDuration(Number(a.duration))) return Number(a.duration);
+  const s = parseHM(a.startTime), e = parseHM(a.endTime);
+  if (s != null && e != null && e > s) return e - s;
+  const svc = serviceOfAppt(business, a);
+  return svc && validDuration(Number(svc.duration)) ? Number(svc.duration) : 30;
+}
+function apptPrice(business, a) {
+  if (typeof a.price === 'number' && Number.isFinite(a.price)) return a.price;
+  const svc = serviceOfAppt(business, a);
+  return svc ? Number(svc.price) || 0 : 0;
+}
+function apptOutFor(business) {
+  return (a) => { const o = apptOut(a); if (o) { o.duration = apptDuration(business, a); o.price = apptPrice(business, a); } return o; };
+}
+const REVENUE_STATUSES = ['confirmed', 'completed', 'reschedule_requested'];
+
 function manageTokenFor(appt) { return appt && appt.manageNonce ? manageLink.makeToken(MANAGE_SECRET, appt._id, appt.manageNonce) : null; }
 function manageUrlFor(business, appt) {
   const token = manageTokenFor(appt);
@@ -1479,7 +1503,7 @@ app.get('/api/businesses/:slug/appointments', requireOwner, async (req, res) => 
 
     const appointments = await db.collection('appointments').find(query).toArray();
     appointments.sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.startTime).localeCompare(String(b.startTime)));
-    res.json(appointments.map(apptOut));
+    res.json(appointments.map(apptOutFor(req.business)));
   } catch (err) {
     console.error('List appointments error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -2152,6 +2176,12 @@ app.get('/api/businesses/:slug/staff', async (req, res) => {
   }
 });
 
+// Owner view of the staff list (M-17): includes inactive members, so the staff screen can show and
+// re-activate them (the public list above hides them, and saving from it would drop them).
+app.get('/api/businesses/:slug/staff/all', requireOwner, async (req, res) => {
+  res.json((req.business.staff || []).map(s => ({ ...publicStaff(s), isActive: s.isActive !== false, workingHours: s.workingHours || null })));
+});
+
 // Update staff — PROTECTED
 app.put('/api/businesses/:slug/staff', requireOwner, async (req, res) => {
   try {
@@ -2259,33 +2289,38 @@ app.get('/api/businesses/:slug/availability', async (req, res) => {
 
 // ============ STATS (PROTECTED) ============
 
+// Dashboard stats (M-13 / L-6): one definition for the whole dashboard. "Week" is the current
+// calendar week (Sunday–Saturday) in the business time zone; revenue counts confirmed, completed
+// and reschedule-requested appointments (price stored on the appointment, else the service price).
 app.get('/api/businesses/:slug/stats', requireOwner, async (req, res) => {
   try {
     const business = req.business;
     const bid = bizIdFilter(business);
-    const now = new Date();
-    const weekAgoStr = T.addDays(T.todayInTz(T.businessTz(business)), -7);
+    const tz = T.businessTz(business);
+    const today = T.todayInTz(tz);
+    const dow = T.DAY_NAMES.indexOf(T.dayNameOf(today));
+    const weekFrom = T.addDays(today, -dow), weekTo = T.addDays(weekFrom, 6);
+    const weekStartMs = T.zonedTimeToUtcMs(weekFrom, '00:00', tz);
 
-    const [weekAppts, weekCancelled, weekCustomers] = await Promise.all([
-      db.collection('appointments').countDocuments({ businessId: bid, date: { $gte: weekAgoStr } }),
-      db.collection('appointments').countDocuments({ businessId: bid, status: 'cancelled', date: { $gte: weekAgoStr } }),
-      db.collection('customers').countDocuments({ businessId: bid, createdAt: { $gte: new Date(now - 7 * 86400000) } })
+    const [weekAppts, weekCustomers] = await Promise.all([
+      db.collection('appointments').find({ businessId: bid, date: { $gte: weekFrom, $lte: weekTo } }).toArray(),
+      db.collection('customers').countDocuments({ businessId: bid, createdAt: { $gte: new Date(weekStartMs) } }),
     ]);
-
-    const confirmed = await db.collection('appointments').find({
-      businessId: bid, status: 'confirmed', date: { $gte: weekAgoStr }
-    }).toArray();
-    let revenue = 0;
-    for (const appt of confirmed) {
-      if (typeof appt.price === 'number') { revenue += appt.price; continue; }
-      const svc = business.services?.find(s => s._id?.toString() === String(appt.serviceId) || s.name === appt.serviceName);
-      if (svc) revenue += svc.price || 0;
-    }
+    const inactive = (a) => a.status === 'cancelled' || a.status === 'declined';
+    const active = weekAppts.filter(a => !inactive(a));
+    const revenueOf = (list) => list.filter(a => REVENUE_STATUSES.includes(a.status)).reduce((sum, a) => sum + apptPrice(business, a), 0);
+    const todayActive = active.filter(a => a.date === today);
+    const cancelled = weekAppts.filter(a => a.status === 'cancelled').length;
 
     res.json({
-      weekAppointments: weekAppts, weekCancelled,
-      cancellationRate: weekAppts > 0 ? Math.round((weekCancelled / weekAppts) * 100) : 0,
-      weekRevenue: revenue, newCustomers: weekCustomers
+      weekFrom, weekTo, today,
+      weekAppointments: active.length,
+      weekCancelled: cancelled,
+      cancellationRate: weekAppts.length > 0 ? Math.round((cancelled / weekAppts.length) * 100) : 0,
+      weekRevenue: revenueOf(active),
+      todayAppointments: todayActive.length,
+      todayRevenue: revenueOf(todayActive),
+      newCustomers: weekCustomers,
     });
   } catch (err) {
     console.error('Stats error:', err);
@@ -2298,7 +2333,6 @@ app.get('/api/businesses/:slug/stats/extended', requireOwner, async (req, res) =
   try {
     const business = req.business;
     const bid = bizIdFilter(business);
-    const now = new Date();
     const today = T.todayInTz(T.businessTz(business));
     const monthStart = today.slice(0, 8) + '01';
 
@@ -2309,22 +2343,17 @@ app.get('/api/businesses/:slug/stats/extended', requireOwner, async (req, res) =
     let monthRevenue = 0;
     const dayCount = [0, 0, 0, 0, 0, 0, 0]; // Sun-Sat
     for (const a of monthAppts) {
-      if (a.status === 'confirmed') {
-        if (typeof a.price === 'number') monthRevenue += a.price;
-        else {
-          const svc = business.services?.find(s => s._id?.toString() === String(a.serviceId) || s.name === a.serviceName);
-          if (svc) monthRevenue += svc.price || 0;
-        }
-      }
+      if (a.status === 'declined') continue;
+      if (REVENUE_STATUSES.includes(a.status)) monthRevenue += apptPrice(business, a);
       if (T.isValidYMD(a.date)) dayCount[T.DAY_NAMES.indexOf(T.dayNameOf(a.date))]++;
     }
 
     const monthCustomers = await db.collection('customers').countDocuments({
-      businessId: bid, createdAt: { $gte: new Date(now.getFullYear(), now.getMonth(), 1) }
+      businessId: bid, createdAt: { $gte: new Date(T.zonedTimeToUtcMs(monthStart, '00:00', T.businessTz(business))) }
     });
 
     res.json({
-      monthAppointments: monthAppts.length,
+      monthAppointments: monthAppts.filter(a => a.status !== 'declined').length,
       monthRevenue,
       monthNewCustomers: monthCustomers,
       busiestDayData: dayCount, // [Sun, Mon, Tue, Wed, Thu, Fri, Sat]
