@@ -864,7 +864,7 @@ function cleanStaffList(list, existing) {
     }
     const services = s.services !== undefined ? s.services : prev.services;
     out.services = (Array.isArray(services) ? services : []).filter(v => typeof v === 'string').map(String).slice(0, 200);
-    if (Array.isArray(s.workingDays)) out.workingDays = s.workingDays.filter(isStr).slice(0, 7);
+    if (Array.isArray(s.workingDays)) out.workingDays = s.workingDays.filter(v => (Number.isInteger(v) && v >= 0 && v <= 6) || (isStr(v) && v.length <= 10)).slice(0, 7);
     else if (Array.isArray(prev.workingDays)) out.workingDays = prev.workingDays;
     if (s.workingHours !== undefined && s.workingHours !== null) out.workingHours = cleanWorkingHours(s.workingHours, prev.workingHours || {});
     else if (prev.workingHours) out.workingHours = prev.workingHours;
@@ -1506,6 +1506,19 @@ app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res)
     if (confirmationNote !== undefined) update.confirmationNote = confirmationNote;
     if (cancellationReason !== undefined) update.cancellationReason = cancellationReason;
     if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+
+    // Re-activating a cancelled/declined appointment (e.g. "Undo" in the dashboard, H-14/M-16)
+    // must not create a double booking if the slot was taken in the meantime.
+    if (update.status && !INACTIVE_STATUSES.includes(update.status)) {
+      const cur = await db.collection('appointments').findOne(ownedFilter(business, req.params.id));
+      if (!cur) return res.status(404).json({ error: 'Appointment not found' });
+      const range = INACTIVE_STATUSES.includes(cur.status) ? apptRange(cur) : null;
+      if (range) {
+        const others = await dayAppointments(business, cur.date, cur._id);
+        const clash = others.some(o => (cur.staffId ? (!o.staffId || String(o.staffId) === String(cur.staffId)) : true) && overlaps(o, range.start, range.end));
+        if (clash) return res.status(409).json({ error: 'Time slot already booked', code: 'conflict' });
+      }
+    }
 
     const result = await db.collection('appointments').findOneAndUpdate(
       ownedFilter(business, req.params.id),

@@ -177,6 +177,24 @@ describe('manage link (H-5)', () => {
   });
 });
 
+describe('undo (H-14 / M-16)', () => {
+  test('restoring a cancelled appointment works, unless the slot was re-booked', async () => {
+    const { slug, auth } = await createBusiness(ctx.api);
+    const d = daysFromToday(6);
+    const r = await book(slug, d, '10:00');
+    const id = r.body.id;
+    assert.equal((await ctx.api.delete(`/api/businesses/${slug}/appointments/${id}`).set(auth).send({})).status, 200);
+    const undo = await ctx.api.put(`/api/businesses/${slug}/appointments/${id}`).set(auth).send({ status: 'pending' });
+    assert.equal(undo.status, 200);
+    assert.equal(undo.body.status, 'pending');
+    await ctx.api.delete(`/api/businesses/${slug}/appointments/${id}`).set(auth).send({});
+    assert.equal((await book(slug, d, '10:00')).status, 201);
+    const clash = await ctx.api.put(`/api/businesses/${slug}/appointments/${id}`).set(auth).send({ status: 'pending' });
+    assert.equal(clash.status, 409);
+    assert.equal(clash.body.code, 'conflict');
+  });
+});
+
 describe('working hours (H-9)', () => {
   test('server validation: bad times / breaks rejected; partial updates keep other days', async () => {
     const { slug, auth } = await createBusiness(ctx.api);
@@ -233,6 +251,9 @@ describe('working hours (H-9)', () => {
     const raw = await ctx.db.collection('businesses').findOne({ slug });
     assert.equal(raw.staff[0].workingHours.sunday.start, '10:00');
     assert.deepEqual(raw.staff[0].services, ['x']);
+    await ctx.api.put(`/api/businesses/${slug}/staff`).set(auth).send({ staff: [{ _id: id, name: 'QA Test Dana R', workingDays: [0, 2, 4] }] });
+    const raw2 = await ctx.db.collection('businesses').findOne({ slug });
+    assert.deepEqual(raw2.staff[0].workingDays, [0, 2, 4], 'numeric working days (staff screen format) are kept');
   });
 });
 
