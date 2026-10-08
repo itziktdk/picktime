@@ -1957,9 +1957,11 @@ app.get('/api/manage/:token/others', manageLimiter, loadManaged, async (req, res
     const list = await db.collection('appointments').find({
       businessId: a.businessId, customerPhone: { $in: phoneVariants(a.customerPhone) }, _id: { $ne: a._id },
       date: { $gte: today }, status: { $in: ACTIVE_STATUSES },
-    }).sort({ date: 1, startTime: 1 }).limit(20).toArray();
+    }).limit(200).toArray();
+    // Sorted in JS: the production store (Cosmos DB Mongo API) rejects a compound sort without a matching index.
+    list.sort((x, y) => String(x.date).localeCompare(String(y.date)) || String(x.startTime).localeCompare(String(y.startTime)));
     const out = [];
-    for (const x of list) {
+    for (const x of list.slice(0, 20)) {
       const url = await ensureManageUrl(b, x);
       out.push({
         date: x.date, startTime: x.startTime, endTime: x.endTime, serviceName: x.serviceName || '', staffName: x.staffName || '',
