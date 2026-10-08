@@ -144,7 +144,11 @@ function publicService(s) {
 }
 
 function publicStaff(s) {
-  return { _id: s._id, id: s._id ? s._id.toString() : undefined, name: s.name, role: s.role, services: (s.services || []).map(String), workingHours: s.workingHours || {} };
+  return {
+    _id: s._id, id: s._id ? s._id.toString() : undefined, name: s.name, role: s.role, services: (s.services || []).map(String), workingHours: s.workingHours || {},
+    // P4-B5: dates only (the owner's note stays private); past ranges dropped.
+    timeOff: upcomingRanges(s.timeOff, T.addDays(T.todayInTz(), -1)),
+  };
 }
 
 /** Find a service by its _id string. Legacy services without _id can match their old `id`. */
@@ -873,6 +877,31 @@ function cleanWorkingHours(input, existing) {
   return out;
 }
 
+// ---- Date ranges (P4-B5): business closed dates / holidays and staff time off.
+// [{ from: 'YYYY-MM-DD', to?: 'YYYY-MM-DD', reason?|note? }] — `to` defaults to `from`, max 366 days.
+const MAX_DATE_RANGES = 100;
+function cleanDateRanges(input, textKey, max = MAX_DATE_RANGES) {
+  if (!Array.isArray(input)) throw new ValidationError('Expected a list of dates', 'invalid_dates');
+  if (input.length > max) throw new ValidationError(`Up to ${max} entries`, 'invalid_dates');
+  return input.map(r => {
+    const from = r && r.from, to = (r && r.to) || from;
+    if (!T.isValidYMD(from) || !T.isValidYMD(to)) throw new ValidationError('Invalid date (expected YYYY-MM-DD)', 'invalid_dates');
+    if (to < from) throw new ValidationError('End date must be on or after the start date', 'invalid_dates');
+    if (T.addDays(from, 366) < to) throw new ValidationError('A range can be at most a year', 'invalid_dates');
+    const out = { from, to };
+    if (isStr(r[textKey]) && r[textKey].trim()) out[textKey] = r[textKey].trim().slice(0, 100);
+    return out;
+  }).sort((a, b) => a.from.localeCompare(b.from));
+}
+function inDateRanges(list, date) { return Array.isArray(list) && list.some(r => r && r.from <= date && date <= (r.to || r.from)); }
+function closedRangeFor(business, date) { return (business.closedDates || []).find(r => r && r.from <= date && date <= (r.to || r.from)) || null; }
+function staffOffOn(sm, date) { return inDateRanges(sm && sm.timeOff, date); }
+/** Upcoming ranges only (public outputs). */
+function upcomingRanges(list, today, textKey) {
+  return (Array.isArray(list) ? list : []).filter(r => r && (r.to || r.from) >= today)
+    .map(r => (textKey && r[textKey] ? { from: r.from, to: r.to || r.from, [textKey]: r[textKey] } : { from: r.from, to: r.to || r.from }));
+}
+
 // ---- Staff (M-17): whitelist fields; keep existing per-staff hours when the client omits them
 function cleanStaffList(list, existing) {
   const prevById = new Map((existing || []).filter(s => s && s._id).map(s => [s._id.toString(), s]));
@@ -891,6 +920,9 @@ function cleanStaffList(list, existing) {
     if (s.workingHours === null) { /* cleared */ }
     else if (s.workingHours !== undefined) out.workingHours = cleanWorkingHours(s.workingHours, prev.workingHours || {});
     else if (prev.workingHours) out.workingHours = prev.workingHours;
+    // timeOff (P4-B5): array = set, omitted = keep.
+    if (s.timeOff !== undefined && s.timeOff !== null) out.timeOff = cleanDateRanges(s.timeOff, 'note', 50);
+    else if (s.timeOff === undefined && Array.isArray(prev.timeOff)) out.timeOff = prev.timeOff;
     return out;
   });
 }
@@ -959,6 +991,7 @@ app.get('/api/businesses/:slug', async (req, res) => {
       services: (services || []).map(publicService),
       workingHours,
       customization,
+      closedDates: upcomingRanges(business.closedDates, T.todayInTz(T.businessTz(business)), 'reason'),
       staff: (business.staff || []).filter(s => s.isActive !== false).map(publicStaff),
     });
   } catch (err) {
@@ -980,8 +1013,9 @@ function cleanReminderSettings(input) {
 app.put('/api/businesses/:slug', requireOwner, async (req, res) => {
   try {
     const business = req.business;
-    const { name, type, phone, email, theme, customization, workingHours, services, staff, reminderSettings, bookingPolicy } = req.body || {};
+    const { name, type, phone, email, theme, customization, workingHours, services, staff, reminderSettings, bookingPolicy, closedDates } = req.body || {};
     const update = {};
+    if (closedDates !== undefined) update.closedDates = cleanDateRanges(closedDates === null ? [] : closedDates, 'reason');
     if (name !== undefined) {
       if (!isNonEmptyStr(name)) return res.status(400).json({ error: 'Name is required', code: 'invalid_name' });
       update.name = name.trim().slice(0, 100);
@@ -1264,16 +1298,26 @@ async function dayAppointments(business, date, excludeId) {
  * Staff members free for [start,end). Appointments without a staff member consume
  * capacity (one person each) because we don't know who will serve them.
  */
-function freeStaff(eligible, appts, start, end, { dayName, bizHours, enforceHours }) {
+/** P4-B5: is this staff member working during [start,end) on date (hours, own breaks, time off)? */
+function staffWorksAt(sm, date, dayName, bizHours, start, end) {
+  if (staffOffOn(sm, date)) return false;
+  const h = staffDayHours(sm, dayName, bizHours);
+  if (!h || start < h.start || end > h.end) return false;
+  return !inBreak(staffDayBreaks(sm, dayName), start, end);
+}
+/** Breaks from the staff member's own hours for the day (only when they have their own entry). */
+function staffDayBreaks(sm, dayName) {
+  const sh = sm && sm.workingHours && sm.workingHours[dayName];
+  return sh && typeof sh === 'object' && sh.enabled !== false ? dayBreaks({ raw: sh }) : [];
+}
+
+function freeStaff(eligible, appts, start, end, { dayName, bizHours, enforceHours, date }) {
   const overlapping = appts.filter(a => overlaps(a, start, end));
   const busy = new Set(overlapping.filter(a => a.staffId).map(a => String(a.staffId)));
   const unassigned = overlapping.filter(a => !a.staffId).length;
   const free = eligible.filter(sm => {
     if (busy.has(sm._id.toString())) return false;
-    if (enforceHours) {
-      const h = staffDayHours(sm, dayName, bizHours);
-      if (!h || start < h.start || end > h.end) return false;
-    }
+    if (enforceHours && !staffWorksAt(sm, date, dayName, bizHours, start, end)) return false;
     return true;
   });
   return free.length > unassigned ? free : [];
@@ -1359,6 +1403,7 @@ async function checkSlot(business, input, { isOwner, excludeId } = {}) {
   const dayName = T.dayNameOf(date);
   const bizHours = businessDayHours(business, dayName);
   if (!isOwner) {
+    if (closedRangeFor(business, date)) throw new BookingError(400, 'The business is closed on this date', 'closed');
     if (!bizHours) throw new BookingError(400, 'The business is closed on this day', 'closed');
     if (start < bizHours.start || end > bizHours.end) throw new BookingError(400, 'Outside working hours', 'outside_hours');
     if (inBreak(dayBreaks(bizHours), start, end)) throw new BookingError(400, 'The business is on a break at this time', 'outside_hours');
@@ -1377,8 +1422,9 @@ async function checkSlot(business, input, { isOwner, excludeId } = {}) {
     if (!staffProvides(sm, svcKey)) throw new BookingError(400, 'Staff member does not provide this service', 'staff_service');
     if (!isOwner) {
       const h = staffDayHours(sm, dayName, bizHours);
-      if (!h) throw new BookingError(400, 'Staff member not available on this day', 'staff_day_off');
+      if (!h || staffOffOn(sm, date)) throw new BookingError(400, 'Staff member not available on this day', 'staff_day_off');
       if (start < h.start || end > h.end) throw new BookingError(400, 'Outside the staff member\'s working hours', 'outside_hours');
+      if (inBreak(staffDayBreaks(sm, dayName), start, end)) throw new BookingError(400, 'The staff member is on a break at this time', 'outside_hours');
     }
     if (appts.some(a => a.staffId && String(a.staffId) === staffId && overlaps(a, start, end))) {
       throw new BookingError(409, 'Time slot already booked', 'conflict');
@@ -1388,7 +1434,9 @@ async function checkSlot(business, input, { isOwner, excludeId } = {}) {
     // "Any staff": assign the first free staff member who provides the service.
     const eligible = staffAll.filter(sm => staffProvides(sm, svcKey));
     if (!eligible.length) throw new BookingError(400, 'No staff member provides this service', 'staff_service');
-    const free = freeStaff(eligible, appts, start, end, { dayName, bizHours, enforceHours: !isOwner });
+    // Owners may book outside hours, but still get someone who is actually working when possible.
+    let free = freeStaff(eligible, appts, start, end, { dayName, bizHours, enforceHours: true, date });
+    if (!free.length && isOwner) free = freeStaff(eligible, appts, start, end, { dayName, bizHours, enforceHours: false, date });
     if (!free.length) throw new BookingError(409, 'Time slot already booked', 'conflict');
     staffMember = free[0];
   } else if (appts.some(a => overlaps(a, start, end))) {
@@ -1841,6 +1889,7 @@ function manageView(business, appt) {
     business: {
       name: business.name, slug: business.slug, theme: business.theme, type: business.type,
       timezone: T.businessTz(business), workingHours: business.workingHours, address: businessAddress(business),
+      closedDates: upcomingRanges(business.closedDates, T.todayInTz(T.businessTz(business))),
     },
     policy: manageState(business, appt),
     manageUrl: manageUrlFor(business, appt),
@@ -1897,6 +1946,32 @@ app.get('/api/manage/:token/ics', manageLimiter, loadManaged, (req, res) => {
   res.set('Cache-Control', 'no-store');
   res.set('Content-Disposition', `attachment; filename="snaptor-${a.date}-${String(a.startTime).replace(':', '')}.ics"`);
   res.type('text/calendar; charset=utf-8').send(body);
+});
+
+// P4-B6 "my appointments": the same customer's other upcoming appointments at this business, each
+// with its own manage link. Reachable only with a valid signed link (no lookup by phone alone).
+app.get('/api/manage/:token/others', manageLimiter, loadManaged, async (req, res) => {
+  try {
+    const a = req.appt, b = req.business;
+    const today = T.todayInTz(T.businessTz(b));
+    const list = await db.collection('appointments').find({
+      businessId: a.businessId, customerPhone: { $in: phoneVariants(a.customerPhone) }, _id: { $ne: a._id },
+      date: { $gte: today }, status: { $in: ACTIVE_STATUSES },
+    }).sort({ date: 1, startTime: 1 }).limit(20).toArray();
+    const out = [];
+    for (const x of list) {
+      const url = await ensureManageUrl(b, x);
+      out.push({
+        date: x.date, startTime: x.startTime, endTime: x.endTime, serviceName: x.serviceName || '', staffName: x.staffName || '',
+        status: x.status, manageToken: manageTokenFor(x), manageUrl: url,
+      });
+    }
+    res.set('Cache-Control', 'no-store');
+    res.json({ appointments: out });
+  } catch (err) {
+    console.error('Manage others error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.get('/api/manage/:token/availability', manageLimiter, loadManaged, async (req, res) => {
@@ -2248,7 +2323,7 @@ app.get('/api/businesses/:slug/staff', async (req, res) => {
 // Owner view of the staff list (M-17): includes inactive members, so the staff screen can show and
 // re-activate them (the public list above hides them, and saving from it would drop them).
 app.get('/api/businesses/:slug/staff/all', requireOwner, async (req, res) => {
-  res.json((req.business.staff || []).map(s => ({ ...publicStaff(s), isActive: s.isActive !== false, workingHours: s.workingHours || null })));
+  res.json((req.business.staff || []).map(s => ({ ...publicStaff(s), isActive: s.isActive !== false, workingHours: s.workingHours || null, timeOff: s.timeOff || [] })));
 });
 
 // Update staff — PROTECTED
@@ -2286,6 +2361,8 @@ async function computeAvailability(business, { date, serviceId, staffId, exclude
   const closed = (message, extra = {}) => ({ date, dayOfWeek, available: false, slots: [], availableServices: [], availableStaff: [], message, ...extra });
 
   if (date < now.date) return closed('Date is in the past', { reason: 'past' });
+  const closedRange = closedRangeFor(business, date);
+  if (closedRange) return closed('Business closed on this date', { reason: 'closed_date', closedReason: closedRange.reason || '' });
   const bizHours = businessDayHours(business, dayOfWeek);
   if (!bizHours) return closed('Business closed on this day', { reason: 'closed' });
   const rawDay = business.workingHours[dayOfWeek];
@@ -2308,21 +2385,26 @@ async function computeAvailability(business, { date, serviceId, staffId, exclude
     if (!staffMember) throw new BookingError(400, 'Staff member not found', 'staff_not_found');
     const h = staffDayHours(staffMember, dayOfWeek, bizHours);
     if (!h) return closed('Staff member not available on this day', { reason: 'staff_day_off' });
+    if (staffOffOn(staffMember, date)) return closed('Staff member is off on this date', { reason: 'staff_time_off' });
     if (svcKey && !staffProvides(staffMember, svcKey)) return closed('Staff member does not provide this service', { reason: 'staff_service' });
     window = { start: Math.max(h.start, bizHours.start), end: Math.min(h.end, bizHours.end) };
   } else if (staffAll.length > 0) {
-    eligible = staffAll.filter(sm => (!svcKey || staffProvides(sm, svcKey)) && staffDayHours(sm, dayOfWeek, bizHours));
+    eligible = staffAll.filter(sm => (!svcKey || staffProvides(sm, svcKey)) && staffDayHours(sm, dayOfWeek, bizHours) && !staffOffOn(sm, date));
     if (!eligible.length) return closed('No staff available on this day', { reason: 'no_staff' });
+    // P4-B5 "any staff" = union of the working staff's hours, inside the business hours.
+    const hs = eligible.map(sm => staffDayHours(sm, dayOfWeek, bizHours));
+    window = { start: Math.max(bizHours.start, Math.min(...hs.map(h => h.start))), end: Math.min(bizHours.end, Math.max(...hs.map(h => h.end))) };
   }
+  const staffBreaks = staffMember ? staffDayBreaks(staffMember, dayOfWeek) : [];
 
   const slots = [];
   for (let m = window.start; m + slotDuration <= window.end; m += slotDuration) {
     const start = m, end = m + slotDuration;
-    if (inBreak(breaks, start, end)) continue; // breaks are not bookable (H-9)
+    if (inBreak(breaks, start, end) || inBreak(staffBreaks, start, end)) continue; // breaks are not bookable (H-9, P4-B5)
     let available;
     if (date === now.date && start <= now.minutes) available = false;
     else if (staffMember) available = !appts.some(a => a.staffId && String(a.staffId) === staffId && overlaps(a, start, end));
-    else if (eligible.length) available = freeStaff(eligible, appts, start, end, { dayName: dayOfWeek, bizHours, enforceHours: true }).length > 0;
+    else if (eligible.length) available = freeStaff(eligible, appts, start, end, { dayName: dayOfWeek, bizHours, enforceHours: true, date }).length > 0;
     else available = !appts.some(a => overlaps(a, start, end));
     slots.push({ start: T.minToHM(start), end: T.minToHM(end), available });
   }
@@ -2333,7 +2415,7 @@ async function computeAvailability(business, { date, serviceId, staffId, exclude
     .filter(s => !allowedIds || allowedIds.includes(serviceKey(s)))
     .map(publicService);
   const availableStaff = staffAll
-    .filter(s => staffDayHours(s, dayOfWeek, bizHours) && (!svcKey || staffProvides(s, svcKey)))
+    .filter(s => staffDayHours(s, dayOfWeek, bizHours) && !staffOffOn(s, date) && (!svcKey || staffProvides(s, svcKey)))
     .map(s => ({ _id: s._id, id: s._id.toString(), name: s.name, role: s.role }));
 
   return { date, dayOfWeek, available: slots.some(s => s.available), slots, availableServices, availableStaff };
