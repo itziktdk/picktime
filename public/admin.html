@@ -274,7 +274,7 @@ function renderCurrentTab() {
   else if (currentTab === 'appointments') renderAppointments(el);
 }
 
-function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function esc(s) { if (s === null || s === undefined || s === '') return ''; return String(s).replace(/[&<>"'`]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;' }[c])); }
 function formatDate(d) { if (!d) return '-'; try { return new Date(d).toLocaleDateString('he-IL'); } catch { return d; } }
 
 function relativeTime(d) {
@@ -345,7 +345,7 @@ function renderBusinesses(el) {
         <td class="actions">
           <button class="btn-sm" onclick='openEdit(${JSON.stringify(b).replace(/'/g,"&#39;")})'>✏️</button>
           <button class="btn-sm toggle" onclick="toggleBusiness('${b._id}')">${active ? '⏸️' : '▶️'}</button>
-          <button class="btn-sm danger" onclick="openDelete('${b._id}',\`${esc(b.name)}\`)">🗑️</button>
+          <button class="btn-sm danger" data-id="${esc(b._id)}" data-name="${esc(b.name)}" onclick="openDelete(this.dataset.id, this.dataset.name)">🗑️</button>
         </td>
       </tr>`;
     }).join('') +

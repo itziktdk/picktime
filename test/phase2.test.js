@@ -266,8 +266,8 @@ describe('phone change (H-12)', () => {
     assert.equal((await post({ phone: '123' })).body.code, 'invalid_phone');
     assert.equal((await post({ phone: '021234567' })).body.code, 'invalid_phone', 'landline is not a login phone');
     assert.equal((await post({ phone })).body.code, 'phone_unchanged');
-    const taken = await post({ phone: other.business.phone });
-    assert.equal(taken.status, 409); assert.equal(taken.body.code, 'phone_taken');
+    const shared = await post({ phone: other.business.phone });
+    assert.equal(shared.status, 409); assert.equal(shared.body.code, 'phone_shared', 'shared number needs acknowledgement (phase 3)');
     const newPhone = fakePhone();
     const ok = await post({ phone: newPhone.replace(/^(\d{3})/, '$1-') });
     assert.equal(ok.status, 200, JSON.stringify(ok.body));
@@ -275,11 +275,11 @@ describe('phone change (H-12)', () => {
     assert.equal(ok.body.business.phone, newPhone);
     const login = await ctx.api.post('/api/auth/login').send({ phone: newPhone, slug });
     assert.equal(login.status, 200);
-    // PUT path is validated as well
+    // The generic update no longer changes the phone (phase 3); echoing the current one is fine
     const bad = await ctx.api.put(`/api/businesses/${slug}`).set(auth).send({ phone: 'abc' });
-    assert.equal(bad.status, 400);
-    const dupe = await ctx.api.put(`/api/businesses/${slug}`).set(auth).send({ phone: other.business.phone });
-    assert.equal(dupe.status, 409);
+    assert.equal(bad.status, 400); assert.equal(bad.body.code, 'phone_change_route');
+    const echo = await ctx.api.put(`/api/businesses/${slug}`).set(auth).send({ phone: newPhone, name: 'QA Test Echo' });
+    assert.equal(echo.status, 200);
   });
 
   test('OTP on: code sent to the new phone, wrong code refused, right code saves; PUT refuses', async () => {
@@ -289,7 +289,7 @@ describe('phone change (H-12)', () => {
     const { slug, auth } = await createBusiness(ctx.api);
     const newPhone = fakePhone();
     const put = await ctx.api.put(`/api/businesses/${slug}`).set(auth).send({ phone: newPhone });
-    assert.equal(put.status, 400); assert.equal(put.body.code, 'phone_verification_required');
+    assert.equal(put.status, 400); assert.equal(put.body.code, 'phone_change_route');
     const s = await ctx.api.post(`/api/businesses/${slug}/phone`).set(auth).send({ phone: newPhone });
     assert.equal(s.status, 200); assert.equal(s.body.otpRequired, true);
     const sent = sender.sent.at(-1);

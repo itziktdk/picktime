@@ -443,7 +443,7 @@ function showError(msg) {
   el.classList.remove('hidden');
 }
 
-function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function esc(s) { if (s === null || s === undefined || s === '') return ''; return String(s).replace(/[&<>"'`]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;' }[c])); }
 
 const themeColors = {
   indigo: { accent: '#6366f1', light: '#818cf8', dark: '#4f46e5' },

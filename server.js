@@ -17,6 +17,12 @@ const reminders = require('./lib/reminders');
 const reminderService = require('./reminder-service.js');
 const manageLink = require('./lib/manage-link');
 const security = require('./lib/security');
+const text = require('./lib/text');
+const staticGuard = require('./lib/static-guard');
+const { MongoRateStore } = require('./lib/rate-store');
+const ics = require('./lib/ics');
+let compression = null;
+try { compression = require('compression'); } catch { console.warn('[startup] compression module missing; responses are not compressed'); }
 
 const IS_PROD = process.env.NODE_ENV === 'production';
 
@@ -47,25 +53,11 @@ app.set('trust proxy', 1);
 
 // ============ SECURITY HELPERS ============
 
-// XSS sanitization
-function sanitize(str) {
-  if (typeof str !== 'string') return str;
-  return str.replace(/<[^>]*>/g, '').replace(/[<>"'&]/g, (c) => {
-    return { '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '&': '&amp;' }[c];
-  }).trim();
-}
-
-function sanitizeObject(obj) {
-  if (!obj || typeof obj !== 'object') return obj;
-  if (Array.isArray(obj)) return obj.map(v => typeof v === 'string' ? sanitize(v) : typeof v === 'object' ? sanitizeObject(v) : v);
-  const clean = {};
-  for (const [key, val] of Object.entries(obj)) {
-    if (typeof val === 'string') clean[key] = sanitize(val);
-    else if (typeof val === 'object' && val !== null) clean[key] = sanitizeObject(val);
-    else clean[key] = val;
-  }
-  return clean;
-}
+// Input text cleanup (M-2): store text as typed, minus HTML tags / angle brackets / control chars.
+// Rendering escapes (React; esc() in the legacy pages). Legacy entity-encoded values are decoded
+// in API responses (lib/text.js decodeJsonResponses).
+const sanitize = text.cleanText;
+const sanitizeObject = text.cleanDeep;
 
 // NoSQL injection prevention
 function sanitizeQuery(str) {
@@ -285,35 +277,57 @@ const apiLimiter = rateLimit({
   message: { error: 'Too many requests. Please try again shortly.' },
 });
 
+// M-12: abuse limiters keep their counters in MongoDB (shared across instances, survive restarts).
+const mongoStore = (prefix) => new MongoRateStore(() => db, prefix);
+
+// The owner of THIS business booking walk-ins is not an anonymous client: skip the per-IP limit.
+async function isOwnerOfSlug(req) {
+  const h = req.headers.authorization;
+  if (!h || !h.startsWith('Bearer ')) return false;
+  try {
+    const decoded = jwt.verify(h.slice(7), JWT_SECRET);
+    if (!decoded || !decoded.businessId || !db) return false;
+    const biz = await getBusinessBySlug(req.params.slug);
+    return !!biz && String(biz._id) === String(decoded.businessId);
+  } catch { return false; }
+}
+
 const bookingLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
   max: intEnv('BOOKING_RATE_LIMIT', 10),
-  message: { error: 'Too many bookings. Try again later.' },
+  message: { error: 'Too many bookings. Try again later.', code: 'rate_limited' },
   validate: false,
+  skipFailedRequests: true, // only bookings that were actually created count
+  skip: isOwnerOfSlug,
+  store: mongoStore('booking'),
   keyGenerator: (req) => 'ip:' + clientIp(req),
 });
 
 const createBusinessLimiter = rateLimit({
   windowMs: 24 * 60 * 60 * 1000, // 24 hours
   max: intEnv('CREATE_BUSINESS_RATE_LIMIT', 3),
-  message: { error: 'Too many businesses created. Try again tomorrow.' },
+  message: { error: 'Too many businesses created. Try again tomorrow.', code: 'rate_limited' },
   validate: false,
+  skipFailedRequests: true,
+  store: mongoStore('create'),
   keyGenerator: (req) => 'ip:' + clientIp(req),
 });
 
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: intEnv('LOGIN_RATE_LIMIT', 20),
-  message: { error: 'Too many login attempts. Try again later.' },
+  message: { error: 'Too many login attempts. Try again later.', code: 'rate_limited' },
   validate: false,
+  store: mongoStore('login'),
   keyGenerator: (req) => 'ip:' + clientIp(req),
 });
 
 const adminLoginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: intEnv('ADMIN_LOGIN_RATE_LIMIT', 10),
-  message: { error: 'Too many attempts. Try again later.' },
+  message: { error: 'Too many attempts. Try again later.', code: 'rate_limited' },
   validate: false,
+  store: mongoStore('admin'),
   keyGenerator: (req) => 'ip:' + clientIp(req),
 });
 
@@ -327,6 +341,8 @@ const OTP_SEND_LIMITS = [
 
 // ============ MIDDLEWARE ============
 
+// M-21: gzip/brotli-negotiated compression for HTML, JS bundles and JSON.
+if (compression) app.use(compression({ threshold: 1024 }));
 app.use(helmet({ contentSecurityPolicy: false }));
 // Content-Security-Policy (CSP_MODE=enforce|report-only|off). The Expo web bundle needs no
 // inline scripts or eval; the legacy admin/book pages get a looser policy (inline scripts).
@@ -343,9 +359,14 @@ app.post('/api/csp-report', express.json({ type: ['application/csp-report', 'app
 });
 app.use(express.json({ limit: '200kb' }));
 app.use(sanitizeBody);
+// M-2: legacy records were entity-encoded on write; decode them in every API response.
+app.use('/api', text.decodeJsonResponses);
 
-// Static files FIRST — never touch the API rate limiter
-app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h', index: false }));
+// L-14: robots/sitemap/manifest, no SPA for dotfiles/server files, stale exports redirect.
+app.use(staticGuard.guard(process.env));
+// Static files FIRST — never touch the API rate limiter. Hashed bundles/assets are immutable (M-21).
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h', index: false, setHeaders: staticGuard.staticHeaders }));
+app.use(staticGuard.missingStatic);
 
 // API rate limiter (skips non-/api and /api/health via skip())
 app.use(apiLimiter);
@@ -873,10 +894,13 @@ function cleanStaffList(list, existing) {
 }
 
 // ---- Phone (H-12)
-async function phoneTakenByOther(phone, businessId) {
-  const other = await db.collection('businesses').findOne(
-    { phone: { $in: phoneVariants(phone) }, _id: { $ne: businessId } }, { projection: { _id: 1 } });
-  return !!other;
+// Multi-business phones are a feature (one owner, several businesses, one login with a business
+// picker), so registration and phone change follow the same rule: a number already used by other
+// businesses is allowed, but the phone-change flow asks the owner to acknowledge it explicitly
+// (acknowledgeShared) and, when OTP login is on, the new number must be verified by code.
+async function othersWithPhone(phone, businessId) {
+  return db.collection('businesses').countDocuments(
+    { phone: { $in: phoneVariants(phone) }, _id: { $ne: businessId } }, { limit: 20 });
 }
 
 // Create business (rate limited)
@@ -962,13 +986,10 @@ app.put('/api/businesses/:slug', requireOwner, async (req, res) => {
     }
     if (type !== undefined && isStr(type)) update.type = type.slice(0, 40);
     if (phone !== undefined && phoneKey(phone) !== phoneKey(business.phone)) {
-      // The phone is the login credential: changes go through POST /phone (format, uniqueness,
-      // OTP when enabled). Older clients may still send it here, so apply the same rules.
-      if (otpEnabled()) return res.status(400).json({ error: 'Changing the phone requires verification', code: 'phone_verification_required' });
-      if (!isValidIsraeliPhone(phone)) return res.status(400).json({ error: 'Invalid mobile number', code: 'invalid_phone' });
-      if (await phoneTakenByOther(phone, business._id)) return res.status(409).json({ error: 'This phone is already used by another business', code: 'phone_taken' });
-      update.phone = phoneKey(phone);
-      logAuth('phone.changed', req, { slug: business.slug, phone: maskPhone(phone), via: 'put' });
+      // The phone is the login credential: it changes only via POST /api/businesses/:slug/phone
+      // (format, explicit shared-number acknowledgement, OTP when enabled). Clients that echo the
+      // unchanged phone back are fine.
+      return res.status(400).json({ error: 'Use the phone change flow to change the login phone', code: 'phone_change_route' });
     }
     if (email !== undefined && isStr(email)) update.email = email.slice(0, 200);
     if (theme !== undefined && isStr(theme)) update.theme = theme.slice(0, 40);
@@ -1030,17 +1051,21 @@ app.get('/api/check-username/:username', async (req, res) => {
 });
 
 // Change the business phone (= the login phone) — PROTECTED (H-12).
-// Validates format and uniqueness; when OTP login is enabled the new number must be verified:
+// Validates the format; a number shared with other businesses needs {acknowledgeShared:true};
+// when OTP login is enabled the new number must be verified:
 //   1) {phone}        → sends a code to the new number, returns {otpRequired:true}
 //   2) {phone, code}  → verifies and saves.
 app.post('/api/businesses/:slug/phone', requireOwner, async (req, res) => {
   try {
     const business = req.business;
-    const { phone, code, lang } = req.body || {};
+    const { phone, code, lang, acknowledgeShared } = req.body || {};
     if (!isValidIsraeliPhone(phone)) return res.status(400).json({ error: 'Invalid mobile number', code: 'invalid_phone' });
     const key = phoneKey(phone);
     if (key === phoneKey(business.phone)) return res.status(400).json({ error: 'This is already your phone number', code: 'phone_unchanged' });
-    if (await phoneTakenByOther(phone, business._id)) return res.status(409).json({ error: 'This phone is already used by another business', code: 'phone_taken' });
+    const shared = await othersWithPhone(phone, business._id);
+    if (shared && acknowledgeShared !== true) {
+      return res.status(409).json({ error: 'This number already logs in to another business', code: 'phone_shared', businesses: shared });
+    }
 
     if (otpEnabled()) {
       const otpKey = `phonechange:${business._id}:${key}`;
@@ -1074,7 +1099,7 @@ app.post('/api/businesses/:slug/phone', requireOwner, async (req, res) => {
 
     const updated = await db.collection('businesses').findOneAndUpdate(
       { _id: business._id }, { $set: { phone: key, phoneChangedAt: new Date() } }, { returnDocument: 'after' });
-    logAuth('phone.changed', req, { slug: business.slug, from: maskPhone(business.phone), to: maskPhone(key), verified: otpEnabled() });
+    logAuth('phone.changed', req, { slug: business.slug, from: maskPhone(business.phone), to: maskPhone(key), verified: otpEnabled(), shared: !!shared });
     res.json({ otpRequired: false, business: normalizeBusiness(updated) });
   } catch (err) {
     console.error('Phone change error:', err);
@@ -1697,6 +1722,11 @@ function manageState(business, appt) {
   };
 }
 
+function businessAddress(b) {
+  const c = b.customization || {};
+  return String(b.address || c.address || '').slice(0, 300);
+}
+
 function manageView(business, appt) {
   const rr = appt.rescheduleRequest;
   return {
@@ -1718,7 +1748,7 @@ function manageView(business, appt) {
     },
     business: {
       name: business.name, slug: business.slug, theme: business.theme, type: business.type,
-      timezone: T.businessTz(business), workingHours: business.workingHours,
+      timezone: T.businessTz(business), workingHours: business.workingHours, address: businessAddress(business),
     },
     policy: manageState(business, appt),
     manageUrl: manageUrlFor(business, appt),
@@ -1749,6 +1779,32 @@ async function loadManaged(req, res, next) {
 
 app.get('/api/manage/:token', manageLimiter, loadManaged, (req, res) => {
   res.json(manageView(req.business, req.appt));
+});
+
+// .ics calendar file for the appointment (Apple Calendar / Outlook; Google via the web link).
+app.get('/api/manage/:token/ics', manageLimiter, loadManaged, (req, res) => {
+  const a = req.appt, b = req.business;
+  if (!T.isValidYMD(a.date) || !T.isValidHM(a.startTime)) return res.status(404).json({ error: 'Not found' });
+  const tz = T.businessTz(b);
+  const startMs = T.zonedTimeToUtcMs(a.date, a.startTime, tz);
+  const endMs = T.isValidHM(a.endTime) ? T.zonedTimeToUtcMs(a.date, a.endTime, tz) : startMs + (Number(a.duration) || 30) * 60000;
+  const name = text.decodeEntities(b.name || 'Snaptor');
+  const service = text.decodeEntities(a.serviceName || '');
+  const url = manageUrlFor(b, a);
+  const lines = [service, a.staffName ? text.decodeEntities(a.staffName) : '', url ? `ניהול התור / Manage: ${url}` : ''].filter(Boolean);
+  const body = ics.buildIcs({
+    uid: `${a._id}@snaptor.app`,
+    startMs, endMs: endMs > startMs ? endMs : startMs + 30 * 60000,
+    summary: service ? `${service} – ${name}` : name,
+    description: lines.join('\n'),
+    location: text.decodeEntities(businessAddress(b)),
+    url,
+    cancelled: !ACTIVE_STATUSES.includes(a.status),
+    sequence: Math.max(0, Math.floor(((a.updatedAt ? new Date(a.updatedAt).getTime() : 0) || 0) / 1000) % 2147483647),
+  });
+  res.set('Cache-Control', 'no-store');
+  res.set('Content-Disposition', `attachment; filename="snaptor-${a.date}-${String(a.startTime).replace(':', '')}.ics"`);
+  res.type('text/calendar; charset=utf-8').send(body);
 });
 
 app.get('/api/manage/:token/availability', manageLimiter, loadManaged, async (req, res) => {
@@ -2479,6 +2535,7 @@ app.all('/api/*', (req, res) => res.status(404).json({ error: 'Not found' }));
 
 // SPA fallback — must be LAST
 app.get('*', (req, res) => {
+  res.set('Cache-Control', 'no-cache');
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
