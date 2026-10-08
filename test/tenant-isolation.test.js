@@ -53,6 +53,7 @@ const objectRoutes = () => [
 // Attacker uses the VICTIM's slug → 403.
 const slugRoutes = () => [
   ['put', `/api/businesses/${A.slug}`, { name: 'pwned' }],
+  ['post', `/api/businesses/${A.slug}/phone`, { phone: '0500000977' }],
   ['get', `/api/businesses/${A.slug}/appointments`, null],
   ['put', `/api/businesses/${A.slug}/appointments/${ids.appt}`, { notes: 'pwned' }],
   ['delete', `/api/businesses/${A.slug}/appointments/${ids.appt}`, {}],

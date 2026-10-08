@@ -15,6 +15,8 @@ const otp = require('./lib/otp');
 const { createSender } = require('./lib/otp-sender');
 const reminders = require('./lib/reminders');
 const reminderService = require('./reminder-service.js');
+const manageLink = require('./lib/manage-link');
+const security = require('./lib/security');
 
 const IS_PROD = process.env.NODE_ENV === 'production';
 
@@ -29,6 +31,8 @@ const OTP_SECRET = process.env.OTP_SECRET || JWT_SECRET;
 const TOKEN_TTL = process.env.TOKEN_TTL || '7d';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (IS_PROD ? '' : 'dev-admin-password');
 const ADMIN_JWT_SECRET = JWT_SECRET + '-admin';
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://snaptor.app';
+const MANAGE_SECRET = manageLink.deriveSecret(process.env, JWT_SECRET);
 const intEnv = (name, def) => { const n = parseInt(process.env[name], 10); return Number.isFinite(n) && n > 0 ? n : def; };
 
 let otpSender = createSender(process.env);
@@ -324,8 +328,20 @@ const OTP_SEND_LIMITS = [
 // ============ MIDDLEWARE ============
 
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors());
-app.use(express.json());
+// Content-Security-Policy (CSP_MODE=enforce|report-only|off). The Expo web bundle needs no
+// inline scripts or eval; the legacy admin/book pages get a looser policy (inline scripts).
+app.use(security.cspMiddleware(process.env));
+// CORS: only the app's own origins (same-origin requests and native apps send no Origin).
+app.use(cors(security.corsOptions(process.env, IS_PROD)));
+// CSP violation reports (browsers send application/csp-report or application/reports+json)
+app.post('/api/csp-report', express.json({ type: ['application/csp-report', 'application/reports+json', 'application/json'], limit: '16kb' }), async (req, res) => {
+  try {
+    const r = await mongoLimit.hit(db, `csp:${clientIp(req)}`, 30, 60 * 60 * 1000);
+    if (r.allowed) console.warn('[csp] violation', security.summarizeCspReport(req.body));
+  } catch { /* never fail a report */ }
+  res.status(204).end();
+});
+app.use(express.json({ limit: '200kb' }));
 app.use(sanitizeBody);
 
 // Static files FIRST — never touch the API rate limiter
@@ -385,6 +401,9 @@ const PUSH_COPY = {
     cancelled_title: 'תור בוטל',
     cancelled_body: ({ customerName, serviceName, date, time }) =>
       `${customerName} — ${serviceName} ב-${date} ${time} בוטל`,
+    reschedule_title: 'בקשה לשינוי מועד',
+    reschedule_body: ({ customerName, serviceName, date, time }) =>
+      `${customerName} מבקש/ת להעביר את ${serviceName} ל-${date} ${time}`,
     reminder_title: 'תזכורת לתור',
     reminder_body: ({ customerName, serviceName, date, time }) =>
       `${customerName} — ${serviceName} ב-${date} ${time}`,
@@ -396,6 +415,9 @@ const PUSH_COPY = {
     cancelled_title: 'Booking cancelled',
     cancelled_body: ({ customerName, serviceName, date, time }) =>
       `${customerName} — ${serviceName} on ${date} at ${time} was cancelled`,
+    reschedule_title: 'Reschedule request',
+    reschedule_body: ({ customerName, serviceName, date, time }) =>
+      `${customerName} asks to move ${serviceName} to ${date} at ${time}`,
     reminder_title: 'Appointment reminder',
     reminder_body: ({ customerName, serviceName, date, time }) =>
       `${customerName} — ${serviceName} on ${date} at ${time}`,
@@ -742,10 +764,119 @@ const DEFAULT_WORKING_HOURS = {
   saturday: { start: '00:00', end: '00:00', enabled: false },
 };
 
+// Services: whitelist fields (no mass assignment) and validate duration/price (M-10).
 function cleanServiceInput(s) {
   if (!s || typeof s !== 'object') return null;
-  const { id, ...rest } = s; // the client-side temporary `id` is not stored; `_id` is the key
-  return rest;
+  if (!isNonEmptyStr(s.name)) return null;
+  const out = { name: s.name.trim().slice(0, 100) };
+  out.duration = validDuration(s.duration) ? Number(s.duration) : 30;
+  out.price = validPrice(s.price) ? Number(s.price) : 0;
+  if (isStr(s.currency)) out.currency = s.currency.slice(0, 8);
+  if (isStr(s.description)) out.description = s.description.slice(0, 500);
+  if (isStr(s.color)) out.color = s.color.slice(0, 20);
+  if (s.isActive === false) out.isActive = false;
+  if (s._id) out._id = s._id;
+  return out;
+}
+
+// ---- Slugs (M-4): format + reserved words (app routes, static files, brand names)
+const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{1,48})[a-z0-9]$/;
+const RESERVED_SLUGS = new Set([
+  'admin', 'api', 'app', 'login', 'logout', 'register', 'signup', 'signin', 'auth', 'account',
+  'settings', 'dashboard', 'privacy', 'support', 'terms', 'help', 'about', 'contact', 'pricing',
+  'book', 'booking', 'manage', 'staff', 'services', 'customers', 'customer-detail', 'appointments',
+  'tasks', 'groups', 'reminders', 'notifications', 'index', 'home', 'new', 'not-found',
+  '_expo', '_sitemap', 'assets', 'static', 'public', 'js', 'css', 'img', 'images', 'fonts',
+  'favicon.ico', 'robots.txt', 'sitemap.xml', 'manifest.json', 'health', 'status',
+  'www', 'mail', 'snaptor', 'picktime', 'test', 'demo', 'null', 'undefined',
+]);
+function slugProblem(slug) {
+  if (!isStr(slug)) return 'invalid';
+  const s = slug.toLowerCase().trim();
+  if (!SLUG_RE.test(s) || s.includes('--')) return 'invalid';
+  if (RESERVED_SLUGS.has(s)) return 'reserved';
+  return null;
+}
+
+// ---- Working hours (H-9): per day enabled/start/end, optional breaks, per-day service mode
+const MAX_BREAKS = 3;
+class ValidationError extends Error {
+  constructor(message, code) { super(message); this.status = 400; this.code = code; }
+}
+function cleanDay(name, d, existing) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) throw new ValidationError(`Invalid hours for ${name}`, 'invalid_hours');
+  const enabled = d.enabled === true;
+  const prev = existing && typeof existing === 'object' ? existing : {};
+  const startStr = isStr(d.start) ? d.start : (prev.start || '09:00');
+  const endStr = isStr(d.end) ? d.end : (prev.end || '18:00');
+  const start = parseHM(startStr), end = parseHM(endStr);
+  if (enabled) {
+    if (start == null || end == null) throw new ValidationError(`Invalid time format for ${name} (HH:MM)`, 'invalid_hours');
+    if (end <= start) throw new ValidationError(`Closing time must be after opening time on ${name}`, 'invalid_hours');
+  }
+  const out = { enabled, start: start != null ? startStr : '09:00', end: end != null ? endStr : '18:00' };
+  if (d.breaks !== undefined) {
+    if (!Array.isArray(d.breaks) || d.breaks.length > MAX_BREAKS) throw new ValidationError(`Up to ${MAX_BREAKS} breaks per day`, 'invalid_breaks');
+    const breaks = d.breaks.map(b => {
+      const bs = b && parseHM(b.start), be = b && parseHM(b.end);
+      if (bs == null || be == null || be <= bs) throw new ValidationError(`Invalid break on ${name}`, 'invalid_breaks');
+      if (enabled && (bs < start || be > end)) throw new ValidationError(`Break on ${name} must be inside working hours`, 'invalid_breaks');
+      return { start: b.start, end: b.end, s: bs, e: be };
+    }).sort((a, b) => a.s - b.s);
+    for (let i = 1; i < breaks.length; i++) {
+      if (breaks[i].s < breaks[i - 1].e) throw new ValidationError(`Breaks overlap on ${name}`, 'invalid_breaks');
+    }
+    out.breaks = breaks.map(({ start: bs, end: be }) => ({ start: bs, end: be }));
+  } else if (Array.isArray(prev.breaks)) {
+    out.breaks = prev.breaks;
+  }
+  const mode = d.serviceMode !== undefined ? d.serviceMode : prev.serviceMode;
+  if (mode === 'custom') {
+    out.serviceMode = 'custom';
+    const ids = d.enabledServices !== undefined ? d.enabledServices : prev.enabledServices;
+    out.enabledServices = (Array.isArray(ids) ? ids : []).filter(v => typeof v === 'string' || typeof v === 'number').map(String).slice(0, 200);
+  } else if (mode === 'all') {
+    out.serviceMode = 'all';
+  }
+  return out;
+}
+/** Validate + normalise working hours. Days not provided keep their existing value. */
+function cleanWorkingHours(input, existing) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new ValidationError('workingHours must be an object', 'invalid_hours');
+  const base = existing && typeof existing === 'object' ? existing : DEFAULT_WORKING_HOURS;
+  const out = {};
+  for (const day of T.DAY_NAMES) {
+    if (input[day] !== undefined) out[day] = cleanDay(day, input[day], base[day]);
+    else if (base[day]) out[day] = base[day];
+  }
+  return out;
+}
+
+// ---- Staff (M-17): whitelist fields; keep existing per-staff hours when the client omits them
+function cleanStaffList(list, existing) {
+  const prevById = new Map((existing || []).filter(s => s && s._id).map(s => [s._id.toString(), s]));
+  return list.filter(s => s && typeof s === 'object' && isNonEmptyStr(s.name)).slice(0, 100).map(s => {
+    const _id = toObjectId(String(s._id || s.id || '')) || new ObjectId();
+    const prev = prevById.get(_id.toString()) || {};
+    const out = { _id, name: s.name.trim().slice(0, 100), isActive: s.isActive !== false };
+    for (const k of ['role', 'phone', 'email', 'color', 'avatar']) {
+      if (isStr(s[k])) out[k] = s[k].slice(0, 200); else if (isStr(prev[k])) out[k] = prev[k];
+    }
+    const services = s.services !== undefined ? s.services : prev.services;
+    out.services = (Array.isArray(services) ? services : []).filter(v => typeof v === 'string').map(String).slice(0, 200);
+    if (Array.isArray(s.workingDays)) out.workingDays = s.workingDays.filter(v => (Number.isInteger(v) && v >= 0 && v <= 6) || (isStr(v) && v.length <= 10)).slice(0, 7);
+    else if (Array.isArray(prev.workingDays)) out.workingDays = prev.workingDays;
+    if (s.workingHours !== undefined && s.workingHours !== null) out.workingHours = cleanWorkingHours(s.workingHours, prev.workingHours || {});
+    else if (prev.workingHours) out.workingHours = prev.workingHours;
+    return out;
+  });
+}
+
+// ---- Phone (H-12)
+async function phoneTakenByOther(phone, businessId) {
+  const other = await db.collection('businesses').findOne(
+    { phone: { $in: phoneVariants(phone) }, _id: { $ne: businessId } }, { projection: { _id: 1 } });
+  return !!other;
 }
 
 // Create business (rate limited)
@@ -753,19 +884,27 @@ app.post('/api/businesses', createBusinessLimiter, async (req, res) => {
   try {
     const { name, slug, type, phone, email, theme, workingHours, services } = req.body || {};
     if (!isNonEmptyStr(name) || !isNonEmptyStr(slug)) return res.status(400).json({ error: 'Name and slug are required' });
+    const problem = slugProblem(slug);
+    if (problem === 'reserved') return res.status(400).json({ error: 'This booking link is reserved', code: 'slug_reserved' });
+    if (problem) return res.status(400).json({ error: 'Booking link may use a-z, 0-9 and dashes (3-50 characters)', code: 'slug_invalid' });
 
-    const existing = await db.collection('businesses').findOne({ slug: slug.toLowerCase() });
-    if (existing) return res.status(409).json({ error: 'Slug already taken' });
+    const existing = await db.collection('businesses').findOne({ slug: slug.toLowerCase().trim() });
+    if (existing) return res.status(409).json({ error: 'Slug already taken', code: 'slug_taken' });
+    let hours = DEFAULT_WORKING_HOURS;
+    if (workingHours !== undefined && workingHours !== null) {
+      try { hours = cleanWorkingHours(workingHours, DEFAULT_WORKING_HOURS); }
+      catch (e) { if (e instanceof ValidationError) return res.status(400).json({ error: e.message, code: e.code }); throw e; }
+    }
 
     const business = {
       name,
-      slug: slug.toLowerCase(),
+      slug: slug.toLowerCase().trim(),
       type: type || 'general',
       phone: isStr(phone) ? phone : '',
       email: isStr(email) ? email : '',
       theme: theme || 'default',
       customization: { colors: {} },
-      workingHours: (workingHours && typeof workingHours === 'object') ? workingHours : DEFAULT_WORKING_HOURS,
+      workingHours: hours,
       services: (Array.isArray(services) ? services : []).map(cleanServiceInput).filter(Boolean).map(s => ({ ...s, _id: new ObjectId() })),
       isActive: true,
       createdAt: new Date()
@@ -815,15 +954,38 @@ function cleanReminderSettings(input) {
 app.put('/api/businesses/:slug', requireOwner, async (req, res) => {
   try {
     const business = req.business;
-    const { name, type, phone, email, theme, customization, workingHours, services, staff, reminderSettings } = req.body || {};
+    const { name, type, phone, email, theme, customization, workingHours, services, staff, reminderSettings, bookingPolicy } = req.body || {};
     const update = {};
-    if (name !== undefined) update.name = name;
-    if (type !== undefined) update.type = type;
-    if (phone !== undefined) update.phone = phone;
-    if (email !== undefined) update.email = email;
-    if (theme !== undefined) update.theme = theme;
+    if (name !== undefined) {
+      if (!isNonEmptyStr(name)) return res.status(400).json({ error: 'Name is required', code: 'invalid_name' });
+      update.name = name.trim().slice(0, 100);
+    }
+    if (type !== undefined && isStr(type)) update.type = type.slice(0, 40);
+    if (phone !== undefined && phoneKey(phone) !== phoneKey(business.phone)) {
+      // The phone is the login credential: changes go through POST /phone (format, uniqueness,
+      // OTP when enabled). Older clients may still send it here, so apply the same rules.
+      if (otpEnabled()) return res.status(400).json({ error: 'Changing the phone requires verification', code: 'phone_verification_required' });
+      if (!isValidIsraeliPhone(phone)) return res.status(400).json({ error: 'Invalid mobile number', code: 'invalid_phone' });
+      if (await phoneTakenByOther(phone, business._id)) return res.status(409).json({ error: 'This phone is already used by another business', code: 'phone_taken' });
+      update.phone = phoneKey(phone);
+      logAuth('phone.changed', req, { slug: business.slug, phone: maskPhone(phone), via: 'put' });
+    }
+    if (email !== undefined && isStr(email)) update.email = email.slice(0, 200);
+    if (theme !== undefined && isStr(theme)) update.theme = theme.slice(0, 40);
     if (customization !== undefined) update.customization = customization;
-    if (workingHours !== undefined) update.workingHours = workingHours;
+    if (workingHours !== undefined) update.workingHours = cleanWorkingHours(workingHours, business.workingHours);
+    if (bookingPolicy !== undefined) {
+      if (!bookingPolicy || typeof bookingPolicy !== 'object') return res.status(400).json({ error: 'Invalid bookingPolicy' });
+      const bp = { ...(business.bookingPolicy || {}) };
+      if (bookingPolicy.cancelCutoffHours !== undefined) {
+        const n = Number(bookingPolicy.cancelCutoffHours);
+        if (!Number.isFinite(n) || n < 0 || n > 168) return res.status(400).json({ error: 'cancelCutoffHours must be 0-168' });
+        bp.cancelCutoffHours = n;
+      }
+      if (bookingPolicy.allowCustomerCancel !== undefined) bp.allowCustomerCancel = bookingPolicy.allowCustomerCancel !== false;
+      if (bookingPolicy.allowCustomerReschedule !== undefined) bp.allowCustomerReschedule = bookingPolicy.allowCustomerReschedule !== false;
+      update.bookingPolicy = bp;
+    }
     if (reminderSettings !== undefined) {
       const rs = cleanReminderSettings(reminderSettings);
       if (!rs) return res.status(400).json({ error: 'Invalid reminderSettings' });
@@ -835,11 +997,9 @@ app.put('/api/businesses/:slug', requireOwner, async (req, res) => {
     }
     if (staff !== undefined) {
       if (!Array.isArray(staff)) return res.status(400).json({ error: 'staff must be an array' });
-      update.staff = staff.filter(s => s && typeof s === 'object').map(s => {
-        const { id, ...rest } = s;
-        return { ...rest, _id: toObjectId(String(s._id || id || '')) || new ObjectId() };
-      });
+      update.staff = cleanStaffList(staff, business.staff);
     }
+    if (!Object.keys(update).length) return res.json(normalizeBusiness(business));
 
     const result = await db.collection('businesses').findOneAndUpdate(
       { _id: business._id },
@@ -849,6 +1009,7 @@ app.put('/api/businesses/:slug', requireOwner, async (req, res) => {
     if (!result) return res.status(404).json({ error: 'Business not found' });
     res.json(normalizeBusiness(result));
   } catch (err) {
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message, code: err.code });
     console.error('Update business by slug error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -857,10 +1018,66 @@ app.put('/api/businesses/:slug', requireOwner, async (req, res) => {
 // Check username availability — PUBLIC
 app.get('/api/check-username/:username', async (req, res) => {
   try {
-    const existing = await db.collection('businesses').findOne({ slug: sanitizeQuery(req.params.username.toLowerCase()) });
-    res.json({ available: !existing, username: req.params.username.toLowerCase() });
+    const username = String(req.params.username || '').toLowerCase().trim();
+    const problem = slugProblem(username);
+    if (problem) return res.json({ available: false, username, reason: problem });
+    const existing = await db.collection('businesses').findOne({ slug: sanitizeQuery(username) });
+    res.json({ available: !existing, username, ...(existing ? { reason: 'taken' } : {}) });
   } catch (err) {
     console.error('Check username error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Change the business phone (= the login phone) — PROTECTED (H-12).
+// Validates format and uniqueness; when OTP login is enabled the new number must be verified:
+//   1) {phone}        → sends a code to the new number, returns {otpRequired:true}
+//   2) {phone, code}  → verifies and saves.
+app.post('/api/businesses/:slug/phone', requireOwner, async (req, res) => {
+  try {
+    const business = req.business;
+    const { phone, code, lang } = req.body || {};
+    if (!isValidIsraeliPhone(phone)) return res.status(400).json({ error: 'Invalid mobile number', code: 'invalid_phone' });
+    const key = phoneKey(phone);
+    if (key === phoneKey(business.phone)) return res.status(400).json({ error: 'This is already your phone number', code: 'phone_unchanged' });
+    if (await phoneTakenByOther(phone, business._id)) return res.status(409).json({ error: 'This phone is already used by another business', code: 'phone_taken' });
+
+    if (otpEnabled()) {
+      const otpKey = `phonechange:${business._id}:${key}`;
+      if (code === undefined || code === null || code === '') {
+        for (const lim of OTP_SEND_LIMITS) {
+          const k = lim.scope === 'phone' ? `otp-send:phone:${key}` : `otp-send:ip:${clientIp(req)}`;
+          const r = await mongoLimit.hit(db, k, lim.max, lim.windowMs);
+          if (!r.allowed) {
+            res.set('Retry-After', String(r.retryAfterSec));
+            return res.status(429).json({ error: 'Too many code requests. Try again later.', retryAfter: r.retryAfterSec });
+          }
+        }
+        const otpCode = await otp.issue(db, OTP_SECRET, otpKey);
+        try { await otpSender.send(key, otpCode, { lang }); }
+        catch (err) {
+          console.error('[auth] phone-change OTP send failed:', err.message);
+          return res.status(502).json({ error: 'Could not send the verification code. Try again shortly.' });
+        }
+        logAuth('phone.change.otp_sent', req, { slug: business.slug, phone: maskPhone(phone) });
+        return res.json({ otpRequired: true, sent: true, expiresIn: Math.round(otp.OTP_TTL_MS / 1000) });
+      }
+      if (!isStr(code) || !/^\d{6}$/.test(code)) return res.status(400).json({ error: '6-digit code required', code: 'otp_invalid' });
+      const result = await otp.verify(db, OTP_SECRET, otpKey, code);
+      if (result !== 'ok') {
+        logAuth('phone.change.otp_fail', req, { slug: business.slug, result });
+        if (result === 'locked') return res.status(429).json({ error: 'Too many wrong codes. Request a new code.', code: 'otp_locked' });
+        if (result === 'expired') return res.status(400).json({ error: 'The code expired. Request a new code.', code: 'otp_expired' });
+        return res.status(400).json({ error: 'Wrong code', code: 'otp_invalid' });
+      }
+    }
+
+    const updated = await db.collection('businesses').findOneAndUpdate(
+      { _id: business._id }, { $set: { phone: key, phoneChangedAt: new Date() } }, { returnDocument: 'after' });
+    logAuth('phone.changed', req, { slug: business.slug, from: maskPhone(business.phone), to: maskPhone(key), verified: otpEnabled() });
+    res.json({ otpRequired: false, business: normalizeBusiness(updated) });
+  } catch (err) {
+    console.error('Phone change error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -973,6 +1190,13 @@ function businessDayHours(business, dayName) {
   return { start, end, raw: bh };
 }
 
+/** Breaks for the day as minute ranges (only enforced for customer bookings / availability). */
+function dayBreaks(bizHours) {
+  const raw = bizHours && bizHours.raw && Array.isArray(bizHours.raw.breaks) ? bizHours.raw.breaks : [];
+  return raw.map(b => ({ start: parseHM(b && b.start), end: parseHM(b && b.end) })).filter(b => b.start != null && b.end != null && b.end > b.start);
+}
+function inBreak(breaks, start, end) { return breaks.some(b => b.start < end && b.end > start); }
+
 function activeStaff(business) {
   return (business.staff || []).filter(s => s && s._id && s.isActive !== false);
 }
@@ -1045,12 +1269,46 @@ class BookingError extends Error {
  * Owner bookings: may be outside hours (walk-ins, overtime) but not on a past date.
  */
 async function createAppointment(business, input, { isOwner }) {
-  const { serviceId, staffId, customerName, customerPhone, customerEmail, date, startTime, notes } = input;
+  const { serviceId, customerName, customerPhone, customerEmail, date, startTime, notes } = input;
 
   if (!isNonEmptyStr(customerName) || !isNonEmptyStr(customerPhone) || !isNonEmptyStr(date) || !isNonEmptyStr(startTime) || !isNonEmptyStr(serviceId)) {
     throw new BookingError(400, 'Missing required fields: customerName, customerPhone, date, startTime, serviceId', 'missing_fields');
   }
   if (!isValidIsraeliPhone(customerPhone)) throw new BookingError(400, 'Invalid phone number format', 'invalid_phone');
+  const { service, staffMember, duration, endTime } = await checkSlot(business, input, { isOwner });
+
+  const appointment = {
+    businessId: business._id,
+    serviceId: service._id || serviceKey(service),
+    serviceName: service.name,
+    staffId: staffMember ? staffMember._id.toString() : '',
+    staffName: staffMember ? (staffMember.name || '') : '',
+    customerName,
+    customerPhone,
+    customerEmail: isStr(customerEmail) ? customerEmail : '',
+    date,
+    startTime,
+    endTime,
+    duration,
+    price: Number(service.price) || 0,
+    status: 'pending',
+    notes: isStr(notes) ? notes : '',
+    source: isOwner ? 'owner' : 'online',
+    manageNonce: manageLink.newNonce(),
+    createdAt: new Date()
+  };
+  return insertAppointment(business, appointment, service);
+}
+
+/**
+ * Validate a requested slot (shared by new bookings and customer reschedule requests).
+ * Returns { service, staffMember, duration, start, end, endTime }.
+ */
+async function checkSlot(business, input, { isOwner, excludeId } = {}) {
+  const { serviceId, staffId, date, startTime } = input;
+  if (!isNonEmptyStr(date) || !isNonEmptyStr(startTime) || !isNonEmptyStr(serviceId)) {
+    throw new BookingError(400, 'Missing required fields: date, startTime, serviceId', 'missing_fields');
+  }
   if (!T.isValidYMD(date)) throw new BookingError(400, 'Invalid date (expected YYYY-MM-DD)', 'invalid_date');
   if (!T.isValidHM(startTime)) throw new BookingError(400, 'Invalid start time (expected HH:MM)', 'invalid_time');
   if (staffId !== undefined && staffId !== null && staffId !== '' && !isStr(staffId)) throw new BookingError(400, 'Invalid staffId', 'invalid_staff');
@@ -1076,11 +1334,12 @@ async function createAppointment(business, input, { isOwner }) {
   if (!isOwner) {
     if (!bizHours) throw new BookingError(400, 'The business is closed on this day', 'closed');
     if (start < bizHours.start || end > bizHours.end) throw new BookingError(400, 'Outside working hours', 'outside_hours');
+    if (inBreak(dayBreaks(bizHours), start, end)) throw new BookingError(400, 'The business is on a break at this time', 'outside_hours');
   }
   const rawDay = business.workingHours && business.workingHours[dayName];
   if (!perDayServiceAllowed(rawDay, svcKey)) throw new BookingError(400, 'Service not available on this day', 'service_unavailable_day');
 
-  const appts = await dayAppointments(business, date);
+  const appts = await dayAppointments(business, date, excludeId);
   const staffAll = activeStaff(business);
   let staffMember = null;
 
@@ -1108,27 +1367,11 @@ async function createAppointment(business, input, { isOwner }) {
   } else if (appts.some(a => overlaps(a, start, end))) {
     throw new BookingError(409, 'Time slot already booked', 'conflict');
   }
+  return { service, staffMember, duration, start, end, endTime };
+}
 
-  const appointment = {
-    businessId: business._id,
-    serviceId: service._id || svcKey,
-    serviceName: service.name,
-    staffId: staffMember ? staffMember._id.toString() : '',
-    staffName: staffMember ? (staffMember.name || '') : '',
-    customerName,
-    customerPhone,
-    customerEmail: isStr(customerEmail) ? customerEmail : '',
-    date,
-    startTime,
-    endTime,
-    duration,
-    price: Number(service.price) || 0,
-    status: 'pending',
-    notes: isStr(notes) ? notes : '',
-    source: isOwner ? 'owner' : 'online',
-    createdAt: new Date()
-  };
-
+async function insertAppointment(business, appointment, service) {
+  const { customerName, customerPhone, customerEmail } = appointment;
   const result = await db.collection('appointments').insertOne(appointment);
   appointment._id = result.insertedId;
 
@@ -1173,7 +1416,27 @@ async function createAppointment(business, input, { isOwner }) {
   return appointment;
 }
 
-function apptOut(a) { return a ? { ...a, id: a._id.toString() } : a; }
+function apptOut(a) {
+  if (!a) return a;
+  const { manageNonce, ...rest } = a; // never expose the nonce
+  return { ...rest, id: a._id.toString() };
+}
+
+function manageTokenFor(appt) { return appt && appt.manageNonce ? manageLink.makeToken(MANAGE_SECRET, appt._id, appt.manageNonce) : null; }
+function manageUrlFor(business, appt) {
+  const token = manageTokenFor(appt);
+  return token ? manageLink.manageUrl(PUBLIC_BASE_URL, business.slug, token) : null;
+}
+/** Manage URL for reminders etc.; gives legacy appointments a nonce on first use. */
+async function ensureManageUrl(business, appt) {
+  if (!appt.manageNonce) {
+    const nonce = manageLink.newNonce();
+    const r = await db.collection('appointments').findOneAndUpdate(
+      { _id: appt._id, manageNonce: { $exists: false } }, { $set: { manageNonce: nonce } }, { returnDocument: 'after' });
+    appt.manageNonce = r ? r.manageNonce : (await db.collection('appointments').findOne({ _id: appt._id }, { projection: { manageNonce: 1 } })).manageNonce;
+  }
+  return manageUrlFor(business, appt);
+}
 
 // ============ APPOINTMENTS ============
 
@@ -1221,7 +1484,7 @@ app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) 
     }
 
     const appointment = await createAppointment(business, body, { isOwner });
-    res.status(201).json(apptOut(appointment));
+    res.status(201).json({ ...apptOut(appointment), manageToken: manageTokenFor(appointment), manageUrl: manageUrlFor(business, appointment) });
   } catch (err) {
     if (err instanceof BookingError) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error('Book appointment error:', err.message);
@@ -1243,6 +1506,19 @@ app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res)
     if (confirmationNote !== undefined) update.confirmationNote = confirmationNote;
     if (cancellationReason !== undefined) update.cancellationReason = cancellationReason;
     if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
+
+    // Re-activating a cancelled/declined appointment (e.g. "Undo" in the dashboard, H-14/M-16)
+    // must not create a double booking if the slot was taken in the meantime.
+    if (update.status && !INACTIVE_STATUSES.includes(update.status)) {
+      const cur = await db.collection('appointments').findOne(ownedFilter(business, req.params.id));
+      if (!cur) return res.status(404).json({ error: 'Appointment not found' });
+      const range = INACTIVE_STATUSES.includes(cur.status) ? apptRange(cur) : null;
+      if (range) {
+        const others = await dayAppointments(business, cur.date, cur._id);
+        const clash = others.some(o => (cur.staffId ? (!o.staffId || String(o.staffId) === String(cur.staffId)) : true) && overlaps(o, range.start, range.end));
+        if (clash) return res.status(409).json({ error: 'Time slot already booked', code: 'conflict' });
+      }
+    }
 
     const result = await db.collection('appointments').findOneAndUpdate(
       ownedFilter(business, req.params.id),
@@ -1372,9 +1648,9 @@ app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', requireO
         return overlaps(a, start, end);
       });
       if (conflict) return res.status(409).json({ error: 'Time slot already booked' });
-      update = { $set: { date, startTime, endTime: T.minToHM(end), status: 'confirmed', 'rescheduleRequest.status': 'accepted' } };
+      update = { $set: { date, startTime, endTime: T.minToHM(end), status: 'confirmed', 'rescheduleRequest.status': 'accepted', 'rescheduleRequest.respondedAt': new Date(), 'rescheduleRequest.previousDate': appointment.date, 'rescheduleRequest.previousTime': appointment.startTime } };
     } else {
-      update = { $set: { status: 'confirmed', 'rescheduleRequest.status': 'declined' } };
+      update = { $set: { status: rr.previousStatus && !INACTIVE_STATUSES.includes(rr.previousStatus) ? rr.previousStatus : 'confirmed', 'rescheduleRequest.status': 'declined', 'rescheduleRequest.respondedAt': new Date() } };
     }
 
     const result = await db.collection('appointments').findOneAndUpdate(filter, update, { returnDocument: 'after' });
@@ -1382,6 +1658,166 @@ app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', requireO
     res.json(apptOut(result));
   } catch (err) {
     console.error('Reschedule response error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============ CUSTOMER MANAGE LINK (PUBLIC, H-5) ============
+// /api/manage/:token — the token is an HMAC-signed link sent to the customer only
+// (booking response, WhatsApp share, calendar invite, reminders).
+
+const ACTIVE_STATUSES = ['pending', 'confirmed', 'reschedule_requested'];
+const DEFAULT_CANCEL_CUTOFF_H = (() => { const n = Number(process.env.CANCEL_CUTOFF_HOURS_DEFAULT); return Number.isFinite(n) && n >= 0 ? n : 0; })();
+
+function bookingPolicyOf(business) {
+  const bp = business.bookingPolicy || {};
+  const cutoff = Number(bp.cancelCutoffHours);
+  return {
+    cancelCutoffHours: Number.isFinite(cutoff) && cutoff >= 0 ? cutoff : DEFAULT_CANCEL_CUTOFF_H,
+    allowCustomerCancel: bp.allowCustomerCancel !== false,
+    allowCustomerReschedule: bp.allowCustomerReschedule !== false,
+  };
+}
+
+function manageState(business, appt) {
+  const policy = bookingPolicyOf(business);
+  const tz = T.businessTz(business);
+  const startMs = T.isValidYMD(appt.date) && T.isValidHM(appt.startTime) ? T.zonedTimeToUtcMs(appt.date, appt.startTime, tz) : 0;
+  const nowMs = Date.now();
+  let reason = null;
+  if (!ACTIVE_STATUSES.includes(appt.status)) reason = appt.status; // cancelled / declined / completed / no_show
+  else if (startMs <= nowMs) reason = 'past';
+  else if (startMs - nowMs < policy.cancelCutoffHours * 3600 * 1000) reason = 'cutoff';
+  const serviceExists = !!findService(business, String(appt.serviceId || ''));
+  return {
+    ...policy,
+    canCancel: !reason && policy.allowCustomerCancel,
+    canReschedule: !reason && policy.allowCustomerReschedule && serviceExists,
+    reason: reason || (!policy.allowCustomerCancel && !policy.allowCustomerReschedule ? 'not_allowed' : null),
+  };
+}
+
+function manageView(business, appt) {
+  const rr = appt.rescheduleRequest;
+  return {
+    appointment: {
+      id: appt._id.toString(),
+      serviceId: String(appt.serviceId || ''),
+      serviceName: appt.serviceName,
+      staffId: appt.staffId || '',
+      staffName: appt.staffName || '',
+      date: appt.date,
+      startTime: appt.startTime,
+      endTime: appt.endTime,
+      duration: appt.duration,
+      price: appt.price,
+      status: appt.status,
+      customerName: appt.customerName,
+      cancelledBy: appt.cancelledBy || null,
+      rescheduleRequest: rr ? { requestedDate: rr.requestedDate, requestedTime: rr.requestedTime, status: rr.status || 'pending', requestedBy: rr.requestedBy || null } : null,
+    },
+    business: {
+      name: business.name, slug: business.slug, theme: business.theme, type: business.type,
+      timezone: T.businessTz(business), workingHours: business.workingHours,
+    },
+    policy: manageState(business, appt),
+    manageUrl: manageUrlFor(business, appt),
+  };
+}
+
+const manageLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: intEnv('MANAGE_RATE_LIMIT', 120),
+  message: { error: 'Too many requests. Try again later.' },
+  validate: false,
+  keyGenerator: (req) => 'ip:' + clientIp(req),
+});
+
+async function loadManaged(req, res, next) {
+  try {
+    const t = manageLink.parse(req.params.token);
+    if (!t) return res.status(404).json({ error: 'Link not found', code: 'invalid_link' });
+    const appt = await db.collection('appointments').findOne({ _id: new ObjectId(t.id) });
+    if (!appt || !manageLink.verify(MANAGE_SECRET, appt, t.sig)) return res.status(404).json({ error: 'Link not found', code: 'invalid_link' });
+    const business = await db.collection('businesses').findOne({ _id: toObjectId(String(appt.businessId)) });
+    if (!business) return res.status(404).json({ error: 'Link not found', code: 'invalid_link' });
+    req.appt = appt;
+    req.business = business;
+    next();
+  } catch (err) { next(err); }
+}
+
+app.get('/api/manage/:token', manageLimiter, loadManaged, (req, res) => {
+  res.json(manageView(req.business, req.appt));
+});
+
+app.get('/api/manage/:token/availability', manageLimiter, loadManaged, async (req, res) => {
+  try {
+    const date = isStr(req.query.date) ? req.query.date : '';
+    if (!T.isValidYMD(date)) return res.status(400).json({ error: 'Invalid date (expected YYYY-MM-DD)' });
+    const a = req.appt;
+    res.json(await computeAvailability(req.business, { date, serviceId: String(a.serviceId || ''), staffId: a.staffId || '', excludeId: a._id }));
+  } catch (err) {
+    if (err instanceof BookingError) return res.status(err.status).json({ error: err.message, code: err.code });
+    console.error('Manage availability error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/manage/:token/cancel', manageLimiter, loadManaged, async (req, res) => {
+  try {
+    const { business, appt } = req;
+    const state = manageState(business, appt);
+    if (!state.canCancel) return res.status(409).json({ error: 'This appointment can no longer be cancelled online', code: `cannot_cancel_${state.reason || 'not_allowed'}` });
+    const reason = isStr(req.body && req.body.reason) ? req.body.reason.slice(0, 300) : '';
+    const set = { status: 'cancelled', cancelledBy: 'customer', cancelledAt: new Date(), cancellationReason: reason };
+    if (appt.rescheduleRequest && (appt.rescheduleRequest.status || 'pending') === 'pending') set['rescheduleRequest.status'] = 'withdrawn';
+    const updated = await db.collection('appointments').findOneAndUpdate(
+      { _id: appt._id, status: { $in: ACTIVE_STATUSES } }, { $set: set }, { returnDocument: 'after' });
+    if (!updated) return res.status(409).json({ error: 'This appointment was already changed', code: 'cannot_cancel_changed' });
+    void notifyBusiness(business._id, {
+      titleKey: 'cancelled_title', bodyKey: 'cancelled_body',
+      payload: { customerName: updated.customerName, serviceName: updated.serviceName, date: updated.date, time: updated.startTime },
+      url: '/(dashboard)/appointments',
+    }).catch(() => {});
+    console.log(`[manage] customer cancelled appt=${appt._id} biz=${business.slug}`);
+    res.json(manageView(business, updated));
+  } catch (err) {
+    console.error('Manage cancel error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/manage/:token/reschedule', manageLimiter, loadManaged, async (req, res) => {
+  try {
+    const { business, appt } = req;
+    const state = manageState(business, appt);
+    if (!state.canReschedule) return res.status(409).json({ error: 'This appointment can no longer be changed online', code: `cannot_reschedule_${state.reason || 'not_allowed'}` });
+    const { date, startTime, reason } = req.body || {};
+    if (date === appt.date && startTime === appt.startTime) return res.status(400).json({ error: 'Pick a different time', code: 'same_time' });
+    const lim = await mongoLimit.hit(db, `manage-resched:${appt._id}`, 10, 24 * 60 * 60 * 1000);
+    if (!lim.allowed) return res.status(429).json({ error: 'Too many requests. Try again later.' });
+    await checkSlot(business, { serviceId: String(appt.serviceId || ''), staffId: appt.staffId || undefined, date, startTime }, { isOwner: false, excludeId: appt._id });
+    const previousStatus = appt.status === 'reschedule_requested'
+      ? ((appt.rescheduleRequest && appt.rescheduleRequest.previousStatus) || 'pending') : appt.status;
+    const rescheduleRequest = {
+      _id: new ObjectId(), requestedDate: date, requestedTime: startTime,
+      reason: isStr(reason) ? reason.slice(0, 300) : '', status: 'pending', requestedBy: 'customer', previousStatus, createdAt: new Date(),
+    };
+    const updated = await db.collection('appointments').findOneAndUpdate(
+      { _id: appt._id, status: { $in: ACTIVE_STATUSES } },
+      { $set: { status: 'reschedule_requested', rescheduleRequest } }, { returnDocument: 'after' });
+    if (!updated) return res.status(409).json({ error: 'This appointment was already changed', code: 'cannot_reschedule_changed' });
+    void notifyBusiness(business._id, {
+      titleKey: 'reschedule_title', bodyKey: 'reschedule_body',
+      payload: { customerName: updated.customerName, serviceName: updated.serviceName, date, time: startTime },
+      url: '/(dashboard)',
+    }).catch(() => {});
+    console.log(`[manage] reschedule requested appt=${appt._id} biz=${business.slug}`);
+    res.json(manageView(business, updated));
+  } catch (err) {
+    if (err instanceof BookingError) return res.status(err.status).json({ error: err.message, code: err.code });
+    console.error('Manage reschedule error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1666,10 +2102,7 @@ app.put('/api/businesses/:slug/staff', requireOwner, async (req, res) => {
     const { staff } = req.body || {};
     if (!Array.isArray(staff)) return res.status(400).json({ error: 'staff must be an array' });
 
-    const staffWithIds = staff.filter(s => s && typeof s === 'object').map(s => {
-      const { id, ...rest } = s;
-      return { ...rest, _id: toObjectId(String(s._id || id || '')) || new ObjectId() };
-    });
+    const staffWithIds = cleanStaffList(staff, req.business.staff);
 
     const result = await db.collection('businesses').findOneAndUpdate(
       { _id: req.business._id },
@@ -1679,12 +2112,77 @@ app.put('/api/businesses/:slug/staff', requireOwner, async (req, res) => {
     if (!result) return res.status(404).json({ error: 'Business not found' });
     res.json(normalizeBusiness(result));
   } catch (err) {
+    if (err instanceof ValidationError) return res.status(400).json({ error: err.message, code: err.code });
     console.error('Update staff error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ============ AVAILABILITY (PUBLIC) ============
+
+/**
+ * Slots for a day. Returns the response body (same shape as before).
+ * excludeId: ignore this appointment (customer moving their own booking).
+ */
+async function computeAvailability(business, { date, serviceId, staffId, excludeId }) {
+  const tz = T.businessTz(business);
+  const now = T.nowInTz(tz);
+  const dayOfWeek = T.dayNameOf(date);
+  const closed = (message, extra = {}) => ({ date, dayOfWeek, available: false, slots: [], availableServices: [], availableStaff: [], message, ...extra });
+
+  if (date < now.date) return closed('Date is in the past', { reason: 'past' });
+  const bizHours = businessDayHours(business, dayOfWeek);
+  if (!bizHours) return closed('Business closed on this day', { reason: 'closed' });
+  const rawDay = business.workingHours[dayOfWeek];
+  const breaks = dayBreaks(bizHours);
+
+  const service = serviceId ? findService(business, serviceId) : null;
+  if (serviceId && !service) throw new BookingError(400, 'Service not found', 'service_not_found');
+  const svcKey = service ? serviceKey(service) : null;
+  if (svcKey && !perDayServiceAllowed(rawDay, svcKey)) return closed('Service not available on this day', { reason: 'service_unavailable_day' });
+
+  const slotDuration = service && validDuration(service.duration) ? Number(service.duration) : 30;
+  const appts = await dayAppointments(business, date, excludeId);
+  const staffAll = activeStaff(business);
+
+  let staffMember = null;
+  let window = { start: bizHours.start, end: bizHours.end };
+  let eligible = [];
+  if (staffId) {
+    staffMember = (business.staff || []).find(s => s && s._id && s._id.toString() === staffId && s.isActive !== false);
+    if (!staffMember) throw new BookingError(400, 'Staff member not found', 'staff_not_found');
+    const h = staffDayHours(staffMember, dayOfWeek, bizHours);
+    if (!h) return closed('Staff member not available on this day', { reason: 'staff_day_off' });
+    if (svcKey && !staffProvides(staffMember, svcKey)) return closed('Staff member does not provide this service', { reason: 'staff_service' });
+    window = { start: Math.max(h.start, bizHours.start), end: Math.min(h.end, bizHours.end) };
+  } else if (staffAll.length > 0) {
+    eligible = staffAll.filter(sm => (!svcKey || staffProvides(sm, svcKey)) && staffDayHours(sm, dayOfWeek, bizHours));
+    if (!eligible.length) return closed('No staff available on this day', { reason: 'no_staff' });
+  }
+
+  const slots = [];
+  for (let m = window.start; m + slotDuration <= window.end; m += slotDuration) {
+    const start = m, end = m + slotDuration;
+    if (inBreak(breaks, start, end)) continue; // breaks are not bookable (H-9)
+    let available;
+    if (date === now.date && start <= now.minutes) available = false;
+    else if (staffMember) available = !appts.some(a => a.staffId && String(a.staffId) === staffId && overlaps(a, start, end));
+    else if (eligible.length) available = freeStaff(eligible, appts, start, end, { dayName: dayOfWeek, bizHours, enforceHours: true }).length > 0;
+    else available = !appts.some(a => overlaps(a, start, end));
+    slots.push({ start: T.minToHM(start), end: T.minToHM(end), available });
+  }
+
+  const allowedIds = rawDay && rawDay.serviceMode === 'custom' && Array.isArray(rawDay.enabledServices)
+    ? rawDay.enabledServices.map(String) : null;
+  const availableServices = (business.services || [])
+    .filter(s => !allowedIds || allowedIds.includes(serviceKey(s)))
+    .map(publicService);
+  const availableStaff = staffAll
+    .filter(s => staffDayHours(s, dayOfWeek, bizHours) && (!svcKey || staffProvides(s, svcKey)))
+    .map(s => ({ _id: s._id, id: s._id.toString(), name: s.name, role: s.role }));
+
+  return { date, dayOfWeek, available: slots.some(s => s.available), slots, availableServices, availableStaff };
+}
 
 app.get('/api/businesses/:slug/availability', async (req, res) => {
   try {
@@ -1693,69 +2191,11 @@ app.get('/api/businesses/:slug/availability', async (req, res) => {
     const serviceId = isStr(req.query.serviceId) ? req.query.serviceId : '';
     if (!date) return res.status(400).json({ error: 'Date parameter required (YYYY-MM-DD)' });
     if (!T.isValidYMD(date)) return res.status(400).json({ error: 'Invalid date (expected YYYY-MM-DD)' });
-
     const business = await getBusinessBySlug(req.params.slug);
     if (!business) return res.status(404).json({ error: 'Business not found' });
-
-    const tz = T.businessTz(business);
-    const now = T.nowInTz(tz);
-    const dayOfWeek = T.dayNameOf(date);
-    const closed = (message, extra = {}) => res.json({ date, dayOfWeek, available: false, slots: [], availableServices: [], availableStaff: [], message, ...extra });
-
-    if (date < now.date) return closed('Date is in the past', { reason: 'past' });
-    const bizHours = businessDayHours(business, dayOfWeek);
-    if (!bizHours) return closed('Business closed on this day', { reason: 'closed' });
-    const rawDay = business.workingHours[dayOfWeek];
-
-    const service = serviceId ? findService(business, serviceId) : null;
-    if (serviceId && !service) return res.status(400).json({ error: 'Service not found' });
-    const svcKey = service ? serviceKey(service) : null;
-    if (svcKey && !perDayServiceAllowed(rawDay, svcKey)) return closed('Service not available on this day', { reason: 'service_unavailable_day' });
-
-    const slotDuration = service && validDuration(service.duration) ? Number(service.duration) : 30;
-    const appts = await dayAppointments(business, date);
-    const staffAll = activeStaff(business);
-
-    let staffMember = null;
-    let window = { start: bizHours.start, end: bizHours.end };
-    let eligible = [];
-    if (staffId) {
-      staffMember = (business.staff || []).find(s => s && s._id && s._id.toString() === staffId && s.isActive !== false);
-      if (!staffMember) return res.status(400).json({ error: 'Staff member not found' });
-      const h = staffDayHours(staffMember, dayOfWeek, bizHours);
-      if (!h) return closed('Staff member not available on this day', { reason: 'staff_day_off' });
-      if (svcKey && !staffProvides(staffMember, svcKey)) return closed('Staff member does not provide this service', { reason: 'staff_service' });
-      window = { start: Math.max(h.start, bizHours.start), end: Math.min(h.end, bizHours.end) };
-    } else if (staffAll.length > 0) {
-      eligible = staffAll.filter(sm => (!svcKey || staffProvides(sm, svcKey)) && staffDayHours(sm, dayOfWeek, bizHours));
-      if (!eligible.length) return closed('No staff available on this day', { reason: 'no_staff' });
-    }
-
-    const slots = [];
-    for (let m = window.start; m + slotDuration <= window.end; m += slotDuration) {
-      const start = m, end = m + slotDuration;
-      let available;
-      if (date === now.date && start <= now.minutes) available = false;
-      else if (staffMember) available = !appts.some(a => a.staffId && String(a.staffId) === staffId && overlaps(a, start, end));
-      else if (eligible.length) available = freeStaff(eligible, appts, start, end, { dayName: dayOfWeek, bizHours, enforceHours: true }).length > 0;
-      else available = !appts.some(a => overlaps(a, start, end));
-      slots.push({ start: T.minToHM(start), end: T.minToHM(end), available });
-    }
-
-    // Build available services for this day
-    const allowedIds = rawDay && rawDay.serviceMode === 'custom' && Array.isArray(rawDay.enabledServices)
-      ? rawDay.enabledServices.map(String) : null;
-    const availableServices = (business.services || [])
-      .filter(s => !allowedIds || allowedIds.includes(serviceKey(s)))
-      .map(publicService);
-
-    // Build available staff for this day + service
-    const availableStaff = staffAll
-      .filter(s => staffDayHours(s, dayOfWeek, bizHours) && (!svcKey || staffProvides(s, svcKey)))
-      .map(s => ({ _id: s._id, id: s._id.toString(), name: s.name, role: s.role }));
-
-    res.json({ date, dayOfWeek, available: slots.some(s => s.available), slots, availableServices, availableStaff });
+    res.json(await computeAvailability(business, { date, serviceId, staffId }));
   } catch (err) {
+    if (err instanceof BookingError) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error('Availability error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -1946,7 +2386,7 @@ app.get('/api/admin/data', adminAuth, async (req, res) => {
     ]);
     // Convert ObjectIds to strings for frontend matching
     businesses.forEach(b => { b._id = b._id.toString(); });
-    appointments.forEach(a => { a._id = a._id.toString(); a.businessId = a.businessId?.toString(); });
+    appointments.forEach(a => { a._id = a._id.toString(); a.businessId = a.businessId?.toString(); delete a.manageNonce; });
     res.json({ businesses, customers, appointments });
   } catch (err) {
     console.error('Admin data error:', err);
@@ -2052,6 +2492,8 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
 // ============ START ============
 
 let scheduler = null;
+reminders.setManageUrlBuilder((biz, appt) => ensureManageUrl(biz, appt));
+
 function startBackground() {
   const mode = String(process.env.REMINDER_SCHEDULER || (IS_PROD ? 'on' : 'off')).toLowerCase();
   if (mode !== 'off' && mode !== 'false' && mode !== '0') {
@@ -2082,5 +2524,5 @@ module.exports = {
   setOtpSender: (s) => { otpSender = s; },
   getOtpSender: () => otpSender,
   JWT_SECRET,
-  _internals: { phoneKey, phoneVariants, toObjectId, createAppointment },
+  _internals: { phoneKey, phoneVariants, toObjectId, createAppointment, slugProblem, cleanWorkingHours, manageTokenFor, MANAGE_SECRET },
 };
