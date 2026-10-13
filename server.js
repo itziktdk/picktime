@@ -127,6 +127,7 @@ function withId(item) {
   return item;
 }
 
+const trialLib = require('./lib/trial');
 function normalizeBusiness(business) {
   if (!business) return business;
   return {
@@ -135,6 +136,7 @@ function normalizeBusiness(business) {
     timezone: T.businessTz(business),
     services: (business.services || []).map(withId),
     staff: (business.staff || []).map(withId),
+    trial: trialLib.trialOf(business), // Sprint 3
   };
 }
 
@@ -404,6 +406,8 @@ async function connectDB() {
   await db.collection('booking_tokens').createIndex({ createdAt: 1 }, { expireAfterSeconds: 15 * 60 });
   await mongoLimit.ensureIndexes(db);
   await otp.ensureIndexes(db);
+  // Sprint 3: trial fields for existing businesses (idempotent, non-blocking)
+  trialLib.backfill(db).catch(err => console.error('[trial] backfill error', err && err.message));
   console.log('Connected to MongoDB');
   return db;
 }
@@ -978,6 +982,7 @@ app.post('/api/businesses', createBusinessLimiter, async (req, res) => {
       isActive: true,
       createdAt: new Date()
     };
+    Object.assign(business, trialLib.trialFieldsFor(business)); // Sprint 3: free first year
 
     const result = await db.collection('businesses').insertOne(business);
     business._id = result.insertedId;
