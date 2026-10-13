@@ -749,6 +749,8 @@ app.delete('/api/account', authMiddleware, async (req, res) => {
       db.collection('customer_imports').deleteMany({ businessId: bidStr }),
       db.collection('calendar_feeds').deleteMany({ businessId: bidStr }),
       db.collection('waitlist').deleteMany({ businessId: bidStr }),
+      db.collection('calendar_connections').deleteMany({ businessId: bidStr }),
+      db.collection('calendar_busy').deleteMany({ businessId: bidStr }),
       db.collection('businesses').deleteOne({ _id: bid }),
     ]);
     logAuth('account.deleted', req, { slug: business.slug });
@@ -1424,6 +1426,7 @@ async function checkSlot(business, input, { isOwner, excludeId } = {}) {
   if (!perDayServiceAllowed(rawDay, svcKey)) throw new BookingError(400, 'Service not available on this day', 'service_unavailable_day');
 
   const appts = await dayAppointments(business, date, excludeId);
+  if (!isOwner) appts.push(...await externalBusy(business, date)); // Sprint 2: connected calendars block online slots
   const staffAll = activeStaff(business);
   let staffMember = null;
 
@@ -1499,6 +1502,7 @@ async function insertAppointment(business, appointment, service) {
     },
     url: '/(dashboard)/appointments',
   }).catch(err => console.error('notify error', err && err.message));
+  void syncAppointment(business, appointment);
 
   return appointment;
 }
@@ -1637,7 +1641,7 @@ app.post('/api/businesses/:slug/appointments/:id/cancel-series', requireOwner, a
     const ids = list.map(a => a._id);
     const reason = isStr(req.body && req.body.cancellationReason) ? req.body.cancellationReason.slice(0, 300) : '';
     if (ids.length) await db.collection('appointments').updateMany({ _id: { $in: ids } }, { $set: { status: 'cancelled', cancelledBy: 'owner', cancelledAt: new Date(), ...(reason ? { cancellationReason: reason } : {}) } });
-    for (const a of list) void notifyWaitlist(business, a);
+    for (const a of list) { void notifyWaitlist(business, a); void syncAppointment(business, { ...a, status: 'cancelled' }); }
     res.json({ success: true, cancelled: ids.length, dates: list.map(a => a.date).sort() });
   } catch (err) { console.error('Cancel series error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
@@ -1697,6 +1701,7 @@ app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res)
     );
     if (!result) return res.status(404).json({ error: 'Appointment not found' });
 
+    void syncAppointment(business, result);
     if (status === 'cancelled') {
       void notifyWaitlist(business, result);
       void notifyBusiness(business._id, {
@@ -1735,6 +1740,7 @@ app.delete('/api/businesses/:slug/appointments/:id', requireOwner, async (req, r
     if (!result) return res.status(404).json({ error: 'Appointment not found' });
 
     void notifyWaitlist(business, result);
+    void syncAppointment(business, result);
     void notifyBusiness(business._id, {
       titleKey: 'cancelled_title',
       bodyKey: 'cancelled_body',
@@ -1794,6 +1800,7 @@ app.post('/api/businesses/:slug/appointments/:id/move', requireOwner, async (req
     if (cur.status === 'reschedule_requested') { set.status = 'confirmed'; set['rescheduleRequest.status'] = 'superseded'; }
     // reminders already sent were for the old time; send them again for the new one
     const result = await db.collection('appointments').findOneAndUpdate(ownedFilter(business, req.params.id), { $set: set, $unset: { reminders: '', pushReminders: '' } }, { returnDocument: 'after' });
+    void syncAppointment(business, result);
     res.json(apptOutFor(business)(result));
   } catch (err) {
     if (err instanceof BookingError) return res.status(err.status).json({ error: err.message, code: err.code });
@@ -2056,6 +2063,7 @@ app.post('/api/manage/:token/cancel', manageLimiter, loadManaged, async (req, re
       { _id: appt._id, status: { $in: ACTIVE_STATUSES } }, { $set: set }, { returnDocument: 'after' });
     if (!updated) return res.status(409).json({ error: 'This appointment was already changed', code: 'cannot_cancel_changed' });
     void notifyWaitlist(business, updated);
+    void syncAppointment(business, updated);
     void notifyBusiness(business._id, {
       titleKey: 'cancelled_title', bodyKey: 'cancelled_body',
       payload: { customerName: updated.customerName, serviceName: updated.serviceName, date: updated.date, time: updated.startTime },
@@ -2615,10 +2623,134 @@ app.post('/api/webhooks/whatsapp', express.urlencoded({ extended: false, limit: 
       { $set: { status: 'cancelled', cancelledBy: 'customer', cancelledVia: 'whatsapp', cancelledAt: new Date() } }, { returnDocument: 'after' });
     if (!updated) return send('cannot_cancel');
     void notifyWaitlist(bestBiz, updated);
+    void syncAppointment(bestBiz, updated);
     void notifyBusiness(bestBiz._id, { titleKey: 'cancelled_title', bodyKey: 'cancelled_body',
       payload: { customerName: updated.customerName, serviceName: updated.serviceName, date: updated.date, time: updated.startTime }, url: '/(dashboard)/appointments' }).catch(() => {});
     return send('cancelled');
   } catch (err) { console.error('WhatsApp webhook error:', err); res.status(500).send('Error'); }
+});
+
+// ============ Sprint 2: TWO-WAY CALENDAR SYNC (Google / Outlook; feature flags, default OFF) ============
+const calsync = require('./lib/calsync');
+const CAL_PROVIDERS = ['google', 'outlook'];
+const hasCalSync = (b) => Array.isArray(b && b.calendarSync) && b.calendarSync.length > 0;
+
+app.get('/api/features', (req, res) => {
+  res.json({ googleCalendarSync: calsync.isEnabled('google'), outlookCalendarSync: calsync.isEnabled('outlook'), whatsappReplies: waReplies.isEnabled() });
+});
+
+async function calAccess(conn) {
+  if (conn.accessToken && conn.expiresAt > Date.now()) return calsync.decrypt(conn.accessToken);
+  const t = await calsync.refresh(conn.provider, calsync.decrypt(conn.refreshToken));
+  const set = { accessToken: calsync.encrypt(t.accessToken), expiresAt: t.expiresAt, lastError: null };
+  if (t.refreshToken) set.refreshToken = calsync.encrypt(t.refreshToken);
+  await db.collection('calendar_connections').updateOne({ _id: conn._id }, { $set: set });
+  return t.accessToken;
+}
+async function calConnections(business) {
+  if (!hasCalSync(business)) return [];
+  const list = await db.collection('calendar_connections').find({ businessId: business._id.toString() }).toArray();
+  return list.filter(c => calsync.isEnabled(c.provider));
+}
+
+/** Busy blocks from connected calendars for one local date, as pseudo-appointments. Fail-open, cached 5 min. */
+const localHM = (ms, tz) => new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date(ms));
+const localYMD = (ms, tz) => new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(ms));
+async function externalBusy(business, date) {
+  try {
+    const conns = await calConnections(business);
+    if (!conns.length) return [];
+    const tz = T.businessTz(business);
+    const from = T.zonedTimeToUtcMs(date, '00:00', tz), to = T.zonedTimeToUtcMs(T.addDays(date, 1), '00:00', tz);
+    const out = [];
+    for (const c of conns) {
+      const key = { businessId: c.businessId, provider: c.provider, date };
+      let cache = await db.collection('calendar_busy').findOne(key);
+      if (!cache || Date.now() - new Date(cache.fetchedAt).getTime() > 5 * 60000) {
+        const tok = await calAccess(c);
+        const blocks = await Promise.race([calsync.busy(c.provider, tok, new Date(from).toISOString(), new Date(to).toISOString()),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('busy timeout')), 4000))]);
+        cache = { ...key, blocks: blocks.map(b => ({ start: b.start, end: b.end })), fetchedAt: new Date() };
+        await db.collection('calendar_busy').updateOne(key, { $set: cache }, { upsert: true });
+      }
+      for (const b of cache.blocks || []) {
+        const s = Math.max(b.start, from), e = Math.min(b.end, to);
+        if (!(e > s)) continue;
+        out.push({ external: true, staffId: '', date, startTime: localHM(s, tz), endTime: e >= to ? '23:59' : localHM(e, tz) });
+      }
+    }
+    return out;
+  } catch (err) { console.error('externalBusy error', err && err.message); return []; }
+}
+
+/** Push one booking to the connected calendars (create / update / delete). Never throws. */
+async function syncAppointment(business, appt) {
+  try {
+    if (!hasCalSync(business) || !appt) return;
+    const conns = await calConnections(business);
+    const tz = T.businessTz(business), businessName = text.decodeEntities(business.name || '');
+    for (const c of conns) {
+      const evId = appt.extEvents && appt.extEvents[c.provider];
+      try {
+        const tok = await calAccess(c);
+        if (INACTIVE_STATUSES.includes(appt.status)) {
+          if (evId) { await calsync.deleteEvent(c.provider, tok, evId); await db.collection('appointments').updateOne({ _id: appt._id }, { $unset: { [`extEvents.${c.provider}`]: '' } }); }
+        } else {
+          const id = await calsync.upsertEvent(c.provider, tok, appt, { tz, businessName }, evId);
+          if (id !== evId) await db.collection('appointments').updateOne({ _id: appt._id }, { $set: { [`extEvents.${c.provider}`]: id } });
+        }
+      } catch (e) {
+        await db.collection('calendar_connections').updateOne({ _id: c._id }, { $set: { lastError: String(e.message || e).slice(0, 200), lastErrorAt: new Date() } });
+      }
+    }
+  } catch (err) { console.error('syncAppointment error', err && err.message); }
+}
+
+app.get('/api/businesses/:slug/calendar-sync', requireOwner, async (req, res) => {
+  try {
+    const conns = await db.collection('calendar_connections').find({ businessId: req.business._id.toString() }).toArray();
+    res.json(CAL_PROVIDERS.map(p => {
+      const c = conns.find(x => x.provider === p);
+      return { provider: p, available: calsync.isEnabled(p), connected: !!c, account: c ? c.account || '' : '', lastError: c ? c.lastError || null : null };
+    }));
+  } catch (err) { console.error('Cal sync status error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/businesses/:slug/calendar-sync/:provider/connect', requireOwner, async (req, res) => {
+  const p = req.params.provider;
+  if (!CAL_PROVIDERS.includes(p) || !calsync.isEnabled(p)) return res.status(404).json({ error: 'Not available', code: 'calsync_off' });
+  const state = jwt.sign({ purpose: 'calsync', bid: req.business._id.toString(), p }, JWT_SECRET, { expiresIn: '10m' });
+  res.json({ url: calsync.authUrl(p, { state, base: PUBLIC_BASE_URL }) });
+});
+
+app.get('/api/calendar-sync/:provider/callback', async (req, res) => {
+  const p = req.params.provider;
+  const back = (r) => res.redirect(302, `/settings?calsync=${r}`);
+  try {
+    if (!CAL_PROVIDERS.includes(p) || !calsync.isEnabled(p)) return res.status(404).send('Not found');
+    let st; try { st = jwt.verify(String(req.query.state || ''), JWT_SECRET); } catch { return back('expired'); }
+    if (!st || st.purpose !== 'calsync' || st.p !== p) return back('expired');
+    if (req.query.error || !isStr(req.query.code)) return back('denied');
+    const t = await calsync.exchangeCode(p, req.query.code, PUBLIC_BASE_URL);
+    if (!t.refreshToken) return back('no_refresh');
+    const bid = st.bid;
+    await db.collection('calendar_connections').updateOne({ businessId: bid, provider: p },
+      { $set: { businessId: bid, provider: p, refreshToken: calsync.encrypt(t.refreshToken), accessToken: calsync.encrypt(t.accessToken), expiresAt: t.expiresAt, connectedAt: new Date(), lastError: null } }, { upsert: true });
+    await db.collection('businesses').updateOne({ _id: toObjectId(bid) }, { $addToSet: { calendarSync: p } });
+    back('ok');
+  } catch (err) { console.error('Cal sync callback error:', err && err.message); back('error'); }
+});
+
+app.delete('/api/businesses/:slug/calendar-sync/:provider', requireOwner, async (req, res) => {
+  try {
+    const p = req.params.provider;
+    if (!CAL_PROVIDERS.includes(p)) return res.status(404).json({ error: 'Not found' });
+    const bid = req.business._id.toString();
+    await db.collection('calendar_connections').deleteMany({ businessId: bid, provider: p });
+    await db.collection('calendar_busy').deleteMany({ businessId: bid, provider: p });
+    await db.collection('businesses').updateOne({ _id: req.business._id }, { $pull: { calendarSync: p } });
+    res.json({ success: true });
+  } catch (err) { console.error('Cal sync disconnect error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // ============ TASKS (ALL PROTECTED) ============
@@ -2760,6 +2892,7 @@ async function computeAvailability(business, { date, serviceId, staffId, exclude
 
   const slotDuration = service && validDuration(service.duration) ? Number(service.duration) : 30;
   const appts = await dayAppointments(business, date, excludeId);
+  appts.push(...await externalBusy(business, date)); // Sprint 2: connected calendars block online slots
   const staffAll = activeStaff(business);
 
   let staffMember = null;
@@ -3072,6 +3205,8 @@ app.delete('/api/admin/businesses/:id', adminAuth, async (req, res) => {
       db.collection('customer_imports').deleteMany({ businessId: bid }),
       db.collection('calendar_feeds').deleteMany({ businessId: bid }),
       db.collection('waitlist').deleteMany({ businessId: bid }),
+      db.collection('calendar_connections').deleteMany({ businessId: bid }),
+      db.collection('calendar_busy').deleteMany({ businessId: bid }),
     ]);
     res.json({ success: true, deleted: business.slug });
   } catch (err) {
