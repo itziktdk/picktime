@@ -171,6 +171,15 @@ function serviceKey(service) {
 function signOwnerToken(business) {
   return jwt.sign({ businessId: business._id.toString(), slug: business.slug }, JWT_SECRET, { expiresIn: TOKEN_TTL });
 }
+// Sprint 3: staff sessions carry role + staffId + the verified phone. Tokens without a role are owner tokens.
+function signStaffToken(business, staff) {
+  return jwt.sign({ businessId: business._id.toString(), slug: business.slug, role: 'staff', staffId: staff._id.toString(), phone: staff.loginPhone }, JWT_SECRET, { expiresIn: TOKEN_TTL });
+}
+function signSession(business, m) { return m && m.role === 'staff' ? signStaffToken(business, m.staff) : signOwnerToken(business); }
+/** A staff token is valid only while that staff member is active, allowed to log in and still has that phone. */
+function staffMemberFor(business, decoded) {
+  return (business.staff || []).find(s => s && s._id && s._id.toString() === decoded.staffId && s.isActive !== false && s.canLogin === true && s.loginPhone && s.loginPhone === decoded.phone) || null;
+}
 
 function logAuth(event, req, extra = {}) {
   const parts = Object.entries(extra).map(([k, v]) => `${k}=${v}`).join(' ');
@@ -192,13 +201,26 @@ async function authMiddleware(req, res, next) {
   const oid = toObjectId(decoded && decoded.businessId);
   if (!oid) return res.status(401).json({ error: 'Invalid token' });
   try {
-    const exists = await db.collection('businesses').findOne({ _id: oid }, { projection: { _id: 1 } });
+    const isStaff = decoded.role === 'staff';
+    const exists = await db.collection('businesses').findOne({ _id: oid }, { projection: isStaff ? { _id: 1, staff: 1, phone: 1 } : { _id: 1, phone: 1 } });
     if (!exists) return res.status(401).json({ error: 'Session expired' });
+    if (isStaff) {
+      const sm = staffMemberFor(exists, decoded);
+      if (!sm) return res.status(401).json({ error: 'Staff access was removed', code: 'staff_revoked' });
+      req.staffName = sm.name;
+    }
+    req.role = isStaff ? 'staff' : 'owner';
+    req.staffId = isStaff ? decoded.staffId : null;
+    req.authPhone = isStaff ? decoded.phone : phoneKey(exists.phone);
   } catch (err) {
     return next(err);
   }
   req.businessId = decoded.businessId;
   req.businessSlug = decoded.slug;
+  next();
+}
+function ownerOnly(req, res, next) {
+  if (req.role === 'staff') return res.status(403).json({ error: 'Only the business owner can do this', code: 'owner_only' });
   next();
 }
 
@@ -216,7 +238,9 @@ async function verifyOwnership(req, res, next) {
   } catch (err) { next(err); }
 }
 
-const requireOwner = [authMiddleware, verifyOwnership];
+const requireOwner = [authMiddleware, verifyOwnership, ownerOnly];
+// Sprint 3: owner or a staff member of this business (calendar, customers, tasks, waitlist).
+const requireMember = [authMiddleware, verifyOwnership];
 
 // Sanitize all POST/PUT bodies
 function sanitizeBody(req, res, next) {
@@ -537,10 +561,34 @@ async function findBusinessesByPhone(phone) {
   return db.collection('businesses').find({ phone: { $in: phoneVariants(phone) } }).toArray();
 }
 
-async function issueSession(res, business, allBusinesses) {
-  const token = signOwnerToken(business);
-  await db.collection('businesses').updateOne({ _id: business._id }, { $set: { lastLogin: new Date() } });
-  return res.json({ exists: true, otpRequired: false, token, business: normalizeBusiness(business), businesses: allBusinesses });
+/** Sprint 3: every studio this phone can enter — as owner, or as a staff member with login access. */
+async function findMemberships(phone) {
+  const key = phoneKey(phone);
+  const owned = await db.collection('businesses').find({ phone: { $in: phoneVariants(phone) } }).toArray();
+  const staffOf = /^0\d{9}$/.test(key) ? await db.collection('businesses').find({ staff: { $elemMatch: { loginPhone: key, canLogin: true } } }).toArray() : [];
+  const list = owned.map(b => ({ business: b, role: 'owner' }));
+  for (const b of staffOf) {
+    const sm = (b.staff || []).find(s => s && s.loginPhone === key && s.canLogin === true && s.isActive !== false);
+    if (sm) list.push({ business: b, role: 'staff', staff: sm });
+  }
+  return list;
+}
+function membershipItem(m) {
+  return { ...businessListItem(m.business), role: m.role, ...(m.role === 'staff' ? { staffId: m.staff._id.toString(), staffName: m.staff.name } : {}) };
+}
+function pickMembership(list, slug, role) {
+  const same = list.filter(m => m.business.slug === slug);
+  return same.find(m => m.role === role) || same.find(m => m.role === 'owner') || same[0] || null;
+}
+function sessionBody(business, m) {
+  const out = normalizeBusiness(business);
+  out.me = m && m.role === 'staff' ? { role: 'staff', staffId: m.staff._id.toString(), name: m.staff.name } : { role: 'owner' };
+  return out;
+}
+async function issueSession(res, business, allBusinesses, m) {
+  const token = signSession(business, m);
+  if (!m || m.role !== 'staff') await db.collection('businesses').updateOne({ _id: business._id }, { $set: { lastLogin: new Date() } });
+  return res.json({ exists: true, otpRequired: false, token, business: sessionBody(business, m), businesses: allBusinesses });
 }
 
 function signLoginTicket(phone) {
@@ -565,11 +613,11 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       // Business selection after a verified code (multi-business phones)
       if (loginTicket !== undefined) {
         if (!verifyLoginTicket(loginTicket, phone)) return res.status(401).json({ error: 'Verification expired. Please log in again.', otpRequired: true });
-        const businesses = await findBusinessesByPhone(phone);
-        const business = businesses.find(b => b.slug === slug);
-        if (!business) return res.status(404).json({ error: 'Business not found' });
-        logAuth('login.ticket', req, { phone: maskPhone(phone), slug: business.slug });
-        return issueSession(res, business, businesses.map(businessListItem));
+        const ms = await findMemberships(phone);
+        const m = pickMembership(ms, slug, req.body.role);
+        if (!m) return res.status(404).json({ error: 'Business not found' });
+        logAuth('login.ticket', req, { phone: maskPhone(phone), slug: m.business.slug, role: m.role });
+        return issueSession(res, m.business, ms.map(membershipItem), m);
       }
 
       if (!isValidIsraeliPhone(phone)) return res.status(400).json({ error: 'Invalid phone number format' });
@@ -601,20 +649,19 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       res.set('Retry-After', String(lim.retryAfterSec));
       return res.status(429).json({ error: 'Too many login attempts. Try again later.' });
     }
-    const businesses = await findBusinessesByPhone(phone);
-    if (!businesses.length) {
+    const ms = await findMemberships(phone);
+    if (!ms.length) {
       logAuth('login.unknown_phone', req, { phone: maskPhone(phone) });
       return res.json({ exists: false, otpRequired: false });
     }
-    const allBusinesses = businesses.map(businessListItem);
-    // If multiple businesses and no slug specified, return list for selection (no token)
-    if (businesses.length > 1 && !slug) {
+    const allBusinesses = ms.map(membershipItem);
+    // If multiple memberships and no slug specified, return list for selection (no token)
+    if (ms.length > 1 && !slug) {
       return res.json({ exists: true, otpRequired: false, businesses: allBusinesses });
     }
-    let business = slug ? businesses.find(b => b.slug === slug) : businesses[0];
-    if (!business) business = businesses[0];
-    logAuth('login.ok', req, { phone: maskPhone(phone), slug: business.slug, mode: 'legacy' });
-    return issueSession(res, business, allBusinesses);
+    const m = (slug && pickMembership(ms, slug, req.body.role)) || ms[0];
+    logAuth('login.ok', req, { phone: maskPhone(phone), slug: m.business.slug, role: m.role, mode: 'legacy' });
+    return issueSession(res, m.business, allBusinesses, m);
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -644,15 +691,15 @@ app.post('/api/auth/verify-otp', otpVerifyLimiter, async (req, res) => {
       if (result === 'expired') return res.status(400).json({ error: 'The code expired. Request a new code.', code: 'otp_expired' });
       return res.status(400).json({ error: 'Wrong code', code: 'otp_invalid' });
     }
-    const businesses = await findBusinessesByPhone(phone);
-    logAuth('otp.verify.ok', req, { phone: maskPhone(phone), businesses: businesses.length });
-    if (!businesses.length) return res.json({ exists: false, phoneVerified: true });
-    const allBusinesses = businesses.map(businessListItem);
-    if (businesses.length > 1 && !slug) {
+    const ms = await findMemberships(phone);
+    logAuth('otp.verify.ok', req, { phone: maskPhone(phone), businesses: ms.length });
+    if (!ms.length) return res.json({ exists: false, phoneVerified: true });
+    const allBusinesses = ms.map(membershipItem);
+    if (ms.length > 1 && !slug) {
       return res.json({ exists: true, businesses: allBusinesses, loginTicket: signLoginTicket(phone) });
     }
-    const business = (slug && businesses.find(b => b.slug === slug)) || businesses[0];
-    return issueSession(res, business, allBusinesses);
+    const m = (slug && pickMembership(ms, slug, req.body.role)) || ms[0];
+    return issueSession(res, m.business, allBusinesses, m);
   } catch (err) {
     console.error('Verify OTP error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -664,7 +711,8 @@ app.post('/api/auth/refresh', authMiddleware, async (req, res) => {
   try {
     const business = await db.collection('businesses').findOne({ _id: new ObjectId(req.businessId) });
     if (!business) return res.status(401).json({ error: 'Session expired' });
-    res.json({ token: signOwnerToken(business) });
+    const sm = req.role === 'staff' ? (business.staff || []).find(s => s._id && s._id.toString() === req.staffId) : null;
+    res.json({ token: sm ? signStaffToken(business, sm) : signOwnerToken(business) });
   } catch (err) {
     console.error('Refresh error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -676,7 +724,8 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
     const business = await db.collection('businesses').findOne({ _id: new ObjectId(req.businessId) });
     if (!business) return res.status(404).json({ error: 'Business not found' });
-    res.json(normalizeBusiness(business));
+    const sm = req.role === 'staff' ? (business.staff || []).find(s => s._id && s._id.toString() === req.staffId) : null;
+    res.json(sessionBody(business, sm ? { role: 'staff', staff: sm } : null));
   } catch (err) {
     console.error('Auth me error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -684,6 +733,35 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 });
 
 // ============ PUSH TOKENS ============
+
+// Sprint 3: studio / role switcher. The phone comes from the session (owner: business phone, staff: verified phone).
+app.get('/api/auth/memberships', authMiddleware, async (req, res) => {
+  try {
+    const ms = req.authPhone ? await findMemberships(req.authPhone) : [];
+    const memberIds = new Set(ms.map(m => m.business._id.toString()));
+    // Studios where this phone is a customer (booking there works as for anyone; listed for convenience).
+    const custs = req.authPhone ? await db.collection('customers').find({ phone: { $in: phoneVariants(req.authPhone) } }, { projection: { businessId: 1 } }).limit(50).toArray() : [];
+    const custBizIds = [...new Set(custs.map(c => String(c.businessId)))].filter(id => !memberIds.has(id)).map(toObjectId).filter(Boolean);
+    const custBiz = custBizIds.length ? await db.collection('businesses').find({ _id: { $in: custBizIds } }, { projection: { name: 1, slug: 1, type: 1 } }).toArray() : [];
+    res.json({
+      current: { slug: req.businessSlug, role: req.role, staffId: req.staffId },
+      memberships: ms.map(membershipItem),
+      customerOf: custBiz.map(b => ({ name: b.name, slug: b.slug, type: b.type })),
+    });
+  } catch (err) { console.error('Memberships error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.post('/api/auth/switch', authMiddleware, async (req, res) => {
+  try {
+    const { slug, role } = req.body || {};
+    if (!isNonEmptyStr(slug)) return res.status(400).json({ error: 'slug is required' });
+    const ms = req.authPhone ? await findMemberships(req.authPhone) : [];
+    const m = pickMembership(ms, slug, role);
+    if (!m || (role && m.role !== role)) return res.status(403).json({ error: 'No access to this studio', code: 'no_membership' });
+    logAuth('session.switch', req, { phone: maskPhone(req.authPhone), slug: m.business.slug, role: m.role });
+    return issueSession(res, m.business, ms.map(membershipItem), m);
+  } catch (err) { console.error('Switch error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
 
 app.post('/api/push-tokens', authMiddleware, async (req, res) => {
   try {
@@ -731,7 +809,7 @@ app.delete('/api/push-tokens', authMiddleware, async (req, res) => {
 });
 
 // Account deletion (App Store 5.1.1(v)) — requires Bearer auth + confirmSlug match
-app.delete('/api/account', authMiddleware, async (req, res) => {
+app.delete('/api/account', authMiddleware, ownerOnly, async (req, res) => {
   try {
     const raw = req.body && req.body.confirmSlug;
     const confirmSlug = (isStr(raw) ? raw : '').toLowerCase().trim();
@@ -926,6 +1004,12 @@ function cleanStaffList(list, existing) {
     const out = { _id, name: s.name.trim().slice(0, 100), isActive: s.isActive !== false };
     for (const k of ['role', 'phone', 'email', 'color', 'avatar']) {
       if (isStr(s[k])) out[k] = s[k].slice(0, 200); else if (isStr(prev[k])) out[k] = prev[k];
+    }
+    // Sprint 3: staff login (opt-in per staff member, by phone + OTP)
+    const canLogin = s.canLogin !== undefined ? s.canLogin === true : prev.canLogin === true;
+    if (canLogin) {
+      if (!isValidIsraeliPhone(out.phone || '')) throw new ValidationError('A valid mobile number is required for staff login', 'staff_login_phone');
+      out.canLogin = true; out.loginPhone = phoneKey(out.phone);
     }
     const services = s.services !== undefined ? s.services : prev.services;
     out.services = (Array.isArray(services) ? services : []).filter(v => typeof v === 'string').map(String).slice(0, 200);
@@ -1559,7 +1643,7 @@ async function ensureManageUrl(business, appt) {
 // ============ APPOINTMENTS ============
 
 // List appointments — PROTECTED (only owner)
-app.get('/api/businesses/:slug/appointments', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/appointments', requireMember, async (req, res) => {
   try {
     const query = { businessId: bizIdFilter(req.business) };
     if (req.query.date) {
@@ -1592,7 +1676,7 @@ app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) 
     if (authHeader && authHeader.startsWith('Bearer ')) {
       try {
         const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
-        if (decoded.businessId === business._id.toString()) isOwner = true;
+        if (decoded.businessId === business._id.toString() && (decoded.role !== 'staff' || staffMemberFor(business, decoded))) isOwner = true;
       } catch {}
     }
 
@@ -1635,7 +1719,7 @@ function cleanRepeat(r) {
 }
 
 // Sprint 2: cancel this and every later booking in the same series.
-app.post('/api/businesses/:slug/appointments/:id/cancel-series', requireOwner, async (req, res) => {
+app.post('/api/businesses/:slug/appointments/:id/cancel-series', requireMember, async (req, res) => {
   try {
     const business = req.business;
     const appt = await db.collection('appointments').findOne(ownedFilter(business, req.params.id));
@@ -1652,7 +1736,7 @@ app.post('/api/businesses/:slug/appointments/:id/cancel-series', requireOwner, a
 });
 
 // Update appointment — PROTECTED
-app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res) => {
+app.put('/api/businesses/:slug/appointments/:id', requireMember, async (req, res) => {
   try {
     const business = req.business;
     const { status, notes, confirmationNote, cancellationReason, customerName, customerPhone } = req.body || {};
@@ -1730,7 +1814,7 @@ app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res)
 });
 
 // Cancel appointment — PROTECTED
-app.delete('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res) => {
+app.delete('/api/businesses/:slug/appointments/:id', requireMember, async (req, res) => {
   try {
     const business = req.business;
     const { cancellationReason } = req.body || {};
@@ -1767,7 +1851,7 @@ app.delete('/api/businesses/:slug/appointments/:id', requireOwner, async (req, r
 
 // Owner moves an appointment (P4-A1): new date/time (and optionally staff), same service.
 // Owner rules: may be outside hours, not in the past, never a double booking.
-app.post('/api/businesses/:slug/appointments/:id/move', requireOwner, async (req, res) => {
+app.post('/api/businesses/:slug/appointments/:id/move', requireMember, async (req, res) => {
   try {
     const business = req.business;
     const { date, startTime } = req.body || {};
@@ -1816,7 +1900,7 @@ app.post('/api/businesses/:slug/appointments/:id/move', requireOwner, async (req
 
 // ============ RESCHEDULE (PROTECTED) ============
 
-app.post('/api/businesses/:slug/appointments/:id/reschedule', requireOwner, async (req, res) => {
+app.post('/api/businesses/:slug/appointments/:id/reschedule', requireMember, async (req, res) => {
   try {
     const { requestedDate, requestedTime, reason } = req.body || {};
     if (!isNonEmptyStr(requestedDate) || !isNonEmptyStr(requestedTime)) {
@@ -1848,7 +1932,7 @@ app.post('/api/businesses/:slug/appointments/:id/reschedule', requireOwner, asyn
   }
 });
 
-app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', requireOwner, async (req, res) => {
+app.put('/api/businesses/:slug/appointments/:id/reschedule/:requestId', requireMember, async (req, res) => {
   try {
     const business = req.business;
     const { action } = req.body || {};
@@ -2169,7 +2253,7 @@ app.delete('/api/businesses/:slug/announcements/:id', requireOwner, async (req, 
 
 // ============ CUSTOMERS (ALL PROTECTED) ============
 
-app.get('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/customers', requireMember, async (req, res) => {
   try {
     const query = { businessId: bizIdFilter(req.business) };
     const { filter, search } = req.query;
@@ -2203,7 +2287,7 @@ app.get('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
   }
 });
 
-app.get('/api/businesses/:slug/customers/groups', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/customers/groups', requireMember, async (req, res) => {
   try {
     const business = req.business;
     const bid = bizIdFilter(business);
@@ -2379,7 +2463,7 @@ app.post('/api/businesses/:slug/customers/import/:batchId/undo', requireOwner, a
   }
 });
 
-app.post('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
+app.post('/api/businesses/:slug/customers', requireMember, async (req, res) => {
   try {
     const { name, phone, email, notes, birthday } = req.body || {};
     if (!isNonEmptyStr(name) || !isNonEmptyStr(phone)) return res.status(400).json({ error: 'Name and phone are required' });
@@ -2402,7 +2486,7 @@ app.post('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
   }
 });
 
-app.get('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/customers/:id', requireMember, async (req, res) => {
   try {
     const business = req.business;
     const customer = await db.collection('customers').findOne(ownedFilter(business, req.params.id));
@@ -2422,7 +2506,7 @@ app.get('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) =>
   }
 });
 
-app.put('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) => {
+app.put('/api/businesses/:slug/customers/:id', requireMember, async (req, res) => {
   try {
     const { name, phone, email, notes, isVip, tags, birthday } = req.body || {};
     const update = {};
@@ -2570,7 +2654,7 @@ app.post('/api/businesses/:slug/waitlist', bookingLimiter, async (req, res) => {
 });
 
 // Owner: open entries from a date (default today), soonest first.
-app.get('/api/businesses/:slug/waitlist', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/waitlist', requireMember, async (req, res) => {
   try {
     const today = T.todayInTz(T.businessTz(req.business));
     const from = T.isValidYMD(req.query.from) ? req.query.from : today;
@@ -2582,7 +2666,7 @@ app.get('/api/businesses/:slug/waitlist', requireOwner, async (req, res) => {
 });
 
 // Owner: mark an entry booked / removed (it leaves the open list).
-app.put('/api/businesses/:slug/waitlist/:id', requireOwner, async (req, res) => {
+app.put('/api/businesses/:slug/waitlist/:id', requireMember, async (req, res) => {
   try {
     const status = req.body && req.body.status;
     if (!['booked', 'removed', 'open'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
@@ -2760,7 +2844,7 @@ app.delete('/api/businesses/:slug/calendar-sync/:provider', requireOwner, async 
 
 // ============ TASKS (ALL PROTECTED) ============
 
-app.get('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/tasks', requireMember, async (req, res) => {
   try {
     const query = { businessId: bizIdFilter(req.business) };
     if (req.query.filter === 'active') query.completed = false;
@@ -2775,7 +2859,7 @@ app.get('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
   }
 });
 
-app.post('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
+app.post('/api/businesses/:slug/tasks', requireMember, async (req, res) => {
   try {
     const { text, dueDate } = req.body || {};
     if (!isNonEmptyStr(text)) return res.status(400).json({ error: 'Text is required' });
@@ -2795,7 +2879,7 @@ app.post('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
   }
 });
 
-app.put('/api/businesses/:slug/tasks/:id', requireOwner, async (req, res) => {
+app.put('/api/businesses/:slug/tasks/:id', requireMember, async (req, res) => {
   try {
     const { text, dueDate, completed } = req.body || {};
     const update = {};
@@ -2817,7 +2901,7 @@ app.put('/api/businesses/:slug/tasks/:id', requireOwner, async (req, res) => {
   }
 });
 
-app.delete('/api/businesses/:slug/tasks/:id', requireOwner, async (req, res) => {
+app.delete('/api/businesses/:slug/tasks/:id', requireMember, async (req, res) => {
   try {
     const result = await db.collection('tasks').deleteOne(ownedFilter(req.business, req.params.id));
     if (result.deletedCount === 0) return res.status(404).json({ error: 'Task not found' });
@@ -2844,7 +2928,7 @@ app.get('/api/businesses/:slug/staff', async (req, res) => {
 
 // Owner view of the staff list (M-17): includes inactive members, so the staff screen can show and
 // re-activate them (the public list above hides them, and saving from it would drop them).
-app.get('/api/businesses/:slug/staff/all', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/staff/all', requireMember, async (req, res) => {
   res.json((req.business.staff || []).map(s => ({ ...publicStaff(s), isActive: s.isActive !== false, workingHours: s.workingHours || null, timeOff: s.timeOff || [] })));
 });
 
@@ -2855,6 +2939,8 @@ app.put('/api/businesses/:slug/staff', requireOwner, async (req, res) => {
     if (!Array.isArray(staff)) return res.status(400).json({ error: 'staff must be an array' });
 
     const staffWithIds = cleanStaffList(staff, req.business.staff);
+    const lp = staffWithIds.filter(s => s.loginPhone).map(s => s.loginPhone);
+    if (new Set(lp).size !== lp.length) return res.status(400).json({ error: 'Two staff members cannot share a login phone', code: 'staff_login_dup' });
 
     const result = await db.collection('businesses').findOneAndUpdate(
       { _id: req.business._id },
@@ -2966,7 +3052,7 @@ app.get('/api/businesses/:slug/availability', async (req, res) => {
 // Dashboard stats (M-13 / L-6): one definition for the whole dashboard. "Week" is the current
 // calendar week (Sunday–Saturday) in the business time zone; revenue counts confirmed, completed
 // and reschedule-requested appointments (price stored on the appointment, else the service price).
-app.get('/api/businesses/:slug/stats', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/stats', requireMember, async (req, res) => {
   try {
     const business = req.business;
     const bid = bizIdFilter(business);
@@ -2992,9 +3078,10 @@ app.get('/api/businesses/:slug/stats', requireOwner, async (req, res) => {
       weekCancelled: cancelled,
       weekNoShows: weekAppts.filter(a => a.status === 'no_show').length,
       cancellationRate: weekAppts.length > 0 ? Math.round((cancelled / weekAppts.length) * 100) : 0,
-      weekRevenue: revenueOf(active),
+      // Sprint 3: revenue is owner-only
+      weekRevenue: req.role === 'staff' ? null : revenueOf(active),
       todayAppointments: todayActive.length,
-      todayRevenue: revenueOf(todayActive),
+      todayRevenue: req.role === 'staff' ? null : revenueOf(todayActive),
       newCustomers: weekCustomers,
     });
   } catch (err) {
@@ -3090,7 +3177,7 @@ app.post('/api/reminders/mark-sent', requireCronSecret, async (req, res) => {
 });
 
 // Get reminder history for a business
-app.get('/api/businesses/:slug/reminders', requireOwner, async (req, res) => {
+app.get('/api/businesses/:slug/reminders', requireMember, async (req, res) => {
   try {
     const appointments = await db.collection('appointments').find({
       businessId: bizIdFilter(req.business),
