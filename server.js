@@ -2582,6 +2582,45 @@ app.put('/api/businesses/:slug/waitlist/:id', requireOwner, async (req, res) => 
   } catch (err) { console.error('Update waitlist error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
+// ============ Sprint 2: WHATSAPP CONFIRM / CANCEL REPLIES (feature flag, default OFF) ============
+const waReplies = require('./lib/wa-replies');
+app.post('/api/webhooks/whatsapp', express.urlencoded({ extended: false, limit: '20kb' }), async (req, res) => {
+  try {
+    if (!waReplies.isEnabled()) return res.status(404).json({ error: 'Not found' });
+    const url = `${PUBLIC_BASE_URL}${req.originalUrl}`;
+    if (!waReplies.validSignature(process.env.TWILIO_AUTH_TOKEN, url, req.body || {}, req.headers['x-twilio-signature'])) return res.status(403).send('Forbidden');
+    const from = String((req.body && req.body.From) || '').replace(/^whatsapp:/, '');
+    const action = waReplies.parseReply(req.body && req.body.Body);
+    const send = (key) => res.type('text/xml').send(waReplies.twiml(waReplies.REPLIES[key]));
+    if (!action) return send('unknown');
+    // Soonest upcoming active booking for this phone that we asked about (any business).
+    const variants = phoneVariants(from);
+    const cands = await db.collection('appointments').find({ customerPhone: { $in: variants }, waReplyAsked: true, status: { $in: ['pending', 'confirmed'] } }).limit(50).toArray();
+    const nowMs = Date.now();
+    let best = null, bestMs = Infinity, bestBiz = null;
+    for (const a of cands) {
+      const biz = await db.collection('businesses').findOne({ _id: toObjectId(String(a.businessId)) });
+      if (!biz || !T.isValidYMD(a.date) || !T.isValidHM(a.startTime)) continue;
+      const ms = T.zonedTimeToUtcMs(a.date, a.startTime, T.businessTz(biz));
+      if (ms > nowMs && ms < bestMs) { best = a; bestMs = ms; bestBiz = biz; }
+    }
+    if (!best) return send('not_found');
+    if (action === 'confirm') {
+      await db.collection('appointments').updateOne({ _id: best._id, status: { $in: ['pending', 'confirmed'] } }, { $set: { status: 'confirmed', confirmedBy: 'customer_whatsapp', confirmedAt: new Date() } });
+      return send('confirmed');
+    }
+    const state = manageState(bestBiz, best);
+    if (!state.canCancel) return send('cannot_cancel');
+    const updated = await db.collection('appointments').findOneAndUpdate({ _id: best._id, status: { $in: ACTIVE_STATUSES } },
+      { $set: { status: 'cancelled', cancelledBy: 'customer', cancelledVia: 'whatsapp', cancelledAt: new Date() } }, { returnDocument: 'after' });
+    if (!updated) return send('cannot_cancel');
+    void notifyWaitlist(bestBiz, updated);
+    void notifyBusiness(bestBiz._id, { titleKey: 'cancelled_title', bodyKey: 'cancelled_body',
+      payload: { customerName: updated.customerName, serviceName: updated.serviceName, date: updated.date, time: updated.startTime }, url: '/(dashboard)/appointments' }).catch(() => {});
+    return send('cancelled');
+  } catch (err) { console.error('WhatsApp webhook error:', err); res.status(500).send('Error'); }
+});
+
 // ============ TASKS (ALL PROTECTED) ============
 
 app.get('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
