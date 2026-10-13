@@ -2172,6 +2172,29 @@ app.get('/api/businesses/:slug/customers/groups', requireOwner, async (req, res)
   }
 });
 
+// Sprint 1 F3: richer customer profile. All fields optional (old documents keep working).
+const CUSTOMER_SOURCES = ['walk_in', 'instagram', 'facebook', 'google', 'tiktok', 'referral', 'website', 'whatsapp', 'import', 'other'];
+function cleanCustomerProfile(body, out) {
+  const { tags, birthday, pinnedNote, source, marketingConsent, preferredStaffId } = body || {};
+  if (tags !== undefined) {
+    if (!Array.isArray(tags)) return 'tags must be an array';
+    const seen = new Set();
+    out.tags = tags.filter(isStr).map(t => t.trim().slice(0, 30)).filter(t => t && !seen.has(t.toLowerCase()) && seen.add(t.toLowerCase())).slice(0, 20);
+  }
+  if (birthday !== undefined) {
+    if (birthday !== '' && !(isStr(birthday) && /^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(birthday))) return 'birthday must be MM-DD';
+    out.birthday = birthday;
+  }
+  if (pinnedNote !== undefined) { if (!isStr(pinnedNote)) return 'pinnedNote must be a string'; out.pinnedNote = pinnedNote.trim().slice(0, 300); }
+  if (source !== undefined) { if (source !== '' && !CUSTOMER_SOURCES.includes(source)) return 'invalid source'; out.source = source; }
+  if (marketingConsent !== undefined) {
+    out.marketingConsent = marketingConsent === true;
+    out.marketingConsentAt = marketingConsent === true ? new Date() : null;
+  }
+  if (preferredStaffId !== undefined) { if (preferredStaffId !== '' && !isStr(preferredStaffId)) return 'invalid preferredStaffId'; out.preferredStaffId = String(preferredStaffId || '').slice(0, 40); }
+  return null;
+}
+
 app.post('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
   try {
     const { name, phone, email, notes, birthday } = req.body || {};
@@ -2181,8 +2204,10 @@ app.post('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
       businessId: req.business._id.toString(),
       name, phone, email: isStr(email) ? email : '', notes: isStr(notes) ? notes : '',
       isVip: false, tags: [], totalVisits: 0, totalSpent: 0,
-      lastVisit: null, birthday: isStr(birthday) ? birthday : '', createdAt: new Date(),
+      lastVisit: null, birthday: '', createdAt: new Date(),
     };
+    const perr = cleanCustomerProfile({ ...req.body, birthday: birthday || undefined }, customer);
+    if (perr) return res.status(400).json({ error: perr });
 
     const result = await db.collection('customers').insertOne(customer);
     customer._id = result.insertedId;
@@ -2205,7 +2230,8 @@ app.get('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) =>
     // P4-A1: full history (every status, newest first) so each row can open the appointment sheet.
     visits.sort((a, b) => `${b.date || ''} ${b.startTime || ''}`.localeCompare(`${a.date || ''} ${a.startTime || ''}`));
 
-    res.json({ ...apptOut(customer), visits: visits.slice(0, 50).map(apptOutFor(business)) });
+    const noShowCount = visits.filter(v => v.status === 'no_show').length;
+    res.json({ ...apptOut(customer), noShowCount, visits: visits.slice(0, 50).map(apptOutFor(business)) });
   } catch (err) {
     console.error('Get customer error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -2221,8 +2247,8 @@ app.put('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) =>
     if (email !== undefined) update.email = email;
     if (notes !== undefined) update.notes = notes;
     if (isVip !== undefined) update.isVip = isVip === true;
-    if (tags !== undefined) update.tags = Array.isArray(tags) ? tags.filter(isStr) : [];
-    if (birthday !== undefined) update.birthday = birthday;
+    const perr = cleanCustomerProfile({ tags, birthday, ...req.body }, update);
+    if (perr) return res.status(400).json({ error: perr });
     if (!Object.keys(update).length) return res.status(400).json({ error: 'Nothing to update' });
 
     const result = await db.collection('customers').findOneAndUpdate(
