@@ -431,6 +431,8 @@ const PUSH_COPY = {
     reschedule_title: 'בקשה לשינוי מועד',
     reschedule_body: ({ customerName, serviceName, date, time }) =>
       `${customerName} מבקש/ת להעביר את ${serviceName} ל-${date} ${time}`,
+    waitlist_title: 'התפנה מקום',
+    waitlist_body: ({ date, time, count }) => `התפנה תור ב-${date} ${time} · ${count} ברשימת ההמתנה`,
     reminder_title: 'תזכורת לתור',
     reminder_body: ({ customerName, serviceName, date, time }) =>
       `${customerName} — ${serviceName} ב-${date} ${time}`,
@@ -445,6 +447,8 @@ const PUSH_COPY = {
     reschedule_title: 'Reschedule request',
     reschedule_body: ({ customerName, serviceName, date, time }) =>
       `${customerName} asks to move ${serviceName} to ${date} at ${time}`,
+    waitlist_title: 'A slot opened up',
+    waitlist_body: ({ date, time, count }) => `A slot opened on ${date} at ${time} · ${count} on the waitlist`,
     reminder_title: 'Appointment reminder',
     reminder_body: ({ customerName, serviceName, date, time }) =>
       `${customerName} — ${serviceName} on ${date} at ${time}`,
@@ -744,6 +748,7 @@ app.delete('/api/account', authMiddleware, async (req, res) => {
       db.collection('push_tokens').deleteMany({ business_id: bidStr }),
       db.collection('customer_imports').deleteMany({ businessId: bidStr }),
       db.collection('calendar_feeds').deleteMany({ businessId: bidStr }),
+      db.collection('waitlist').deleteMany({ businessId: bidStr }),
       db.collection('businesses').deleteOne({ _id: bid }),
     ]);
     logAuth('account.deleted', req, { slug: business.slug });
@@ -997,6 +1002,7 @@ app.get('/api/businesses/:slug', async (req, res) => {
       customization,
       closedDates: upcomingRanges(business.closedDates, T.todayInTz(T.businessTz(business)), 'reason'),
       staff: (business.staff || []).filter(s => s.isActive !== false).map(publicStaff),
+      waitlistEnabled: !!(business.bookingPolicy && business.bookingPolicy.waitlistEnabled),
     });
   } catch (err) {
     console.error('Get business error:', err);
@@ -1045,6 +1051,7 @@ app.put('/api/businesses/:slug', requireOwner, async (req, res) => {
       }
       if (bookingPolicy.allowCustomerCancel !== undefined) bp.allowCustomerCancel = bookingPolicy.allowCustomerCancel !== false;
       if (bookingPolicy.allowCustomerReschedule !== undefined) bp.allowCustomerReschedule = bookingPolicy.allowCustomerReschedule !== false;
+      if (bookingPolicy.waitlistEnabled !== undefined) bp.waitlistEnabled = bookingPolicy.waitlistEnabled === true;
       update.bookingPolicy = bp;
     }
     if (reminderSettings !== undefined) {
@@ -1649,6 +1656,7 @@ app.put('/api/businesses/:slug/appointments/:id', requireOwner, async (req, res)
     if (!result) return res.status(404).json({ error: 'Appointment not found' });
 
     if (status === 'cancelled') {
+      void notifyWaitlist(business, result);
       void notifyBusiness(business._id, {
         titleKey: 'cancelled_title',
         bodyKey: 'cancelled_body',
@@ -1684,6 +1692,7 @@ app.delete('/api/businesses/:slug/appointments/:id', requireOwner, async (req, r
     );
     if (!result) return res.status(404).json({ error: 'Appointment not found' });
 
+    void notifyWaitlist(business, result);
     void notifyBusiness(business._id, {
       titleKey: 'cancelled_title',
       bodyKey: 'cancelled_body',
@@ -2004,6 +2013,7 @@ app.post('/api/manage/:token/cancel', manageLimiter, loadManaged, async (req, re
     const updated = await db.collection('appointments').findOneAndUpdate(
       { _id: appt._id, status: { $in: ACTIVE_STATUSES } }, { $set: set }, { returnDocument: 'after' });
     if (!updated) return res.status(409).json({ error: 'This appointment was already changed', code: 'cannot_cancel_changed' });
+    void notifyWaitlist(business, updated);
     void notifyBusiness(business._id, {
       titleKey: 'cancelled_title', bodyKey: 'cancelled_body',
       payload: { customerName: updated.customerName, serviceName: updated.serviceName, date: updated.date, time: updated.startTime },
@@ -2461,6 +2471,75 @@ app.get('/cal/:token.ics', feedLimiter, async (req, res) => {
   } catch (err) { console.error('Feed error:', err); res.status(500).type('text/plain').send('Error'); }
 });
 
+// ============ Sprint 2: WAITLIST (opt-in per business via bookingPolicy.waitlistEnabled) ============
+const WAITLIST_PREFS = ['any', 'morning', 'afternoon', 'evening'];
+const WAITLIST_OPEN_CAP = 300;
+const waitlistOut = (w) => ({ id: String(w._id), name: w.name, phone: w.phone, date: w.date, serviceId: w.serviceId || null,
+  serviceName: w.serviceName || '', timePref: w.timePref || 'any', note: w.note || '', status: w.status, createdAt: w.createdAt });
+
+/** When a booking is cancelled, tell the owner if people are waiting for that day. Never throws. */
+async function notifyWaitlist(business, appt) {
+  try {
+    if (!business || !appt || !(business.bookingPolicy && business.bookingPolicy.waitlistEnabled)) return;
+    const count = await db.collection('waitlist').countDocuments({ businessId: business._id.toString(), date: appt.date, status: 'open' });
+    if (!count) return;
+    await notifyBusiness(business._id, { titleKey: 'waitlist_title', bodyKey: 'waitlist_body',
+      payload: { date: appt.date, time: appt.startTime, count }, url: '/(dashboard)' });
+  } catch (err) { console.error('notifyWaitlist error', err && err.message); }
+}
+
+// Public: a customer joins the waitlist for a day (only when the business turned it on).
+app.post('/api/businesses/:slug/waitlist', bookingLimiter, async (req, res) => {
+  try {
+    const business = await getBusinessBySlug(req.params.slug);
+    if (!business) return res.status(404).json({ error: 'Business not found' });
+    if (!(business.bookingPolicy && business.bookingPolicy.waitlistEnabled)) return res.status(404).json({ error: 'Waitlist is off', code: 'waitlist_off' });
+    const b = req.body || {};
+    if (!isNonEmptyStr(b.name) || b.name.trim().length > 80) return res.status(400).json({ error: 'Name is required', code: 'invalid_name' });
+    if (!isValidIsraeliPhone(b.phone)) return res.status(400).json({ error: 'Invalid phone', code: 'invalid_phone' });
+    const tz = T.businessTz(business), today = T.todayInTz(tz);
+    if (!T.isValidYMD(b.date) || b.date < today || b.date > T.addDays(today, 120)) return res.status(400).json({ error: 'Invalid date', code: 'invalid_date' });
+    const svc = isStr(b.serviceId) && b.serviceId ? (business.services || []).find(x => String(x._id) === b.serviceId) : null;
+    const bidStr = business._id.toString(), phone = phoneKey(b.phone);
+    const doc = { businessId: bidStr, name: b.name.trim(), phone, date: b.date, serviceId: svc ? String(svc._id) : null, serviceName: svc ? svc.name : '',
+      timePref: WAITLIST_PREFS.includes(b.timePref) ? b.timePref : 'any', note: isStr(b.note) ? b.note.trim().slice(0, 200) : '', status: 'open', createdAt: new Date() };
+    const existing = await db.collection('waitlist').findOne({ businessId: bidStr, phone, date: b.date, status: 'open' });
+    if (existing) {
+      await db.collection('waitlist').updateOne({ _id: existing._id }, { $set: { name: doc.name, serviceId: doc.serviceId, serviceName: doc.serviceName, timePref: doc.timePref, note: doc.note } });
+      return res.json({ success: true, id: String(existing._id), updated: true });
+    }
+    if (await db.collection('waitlist').countDocuments({ businessId: bidStr, status: 'open' }) >= WAITLIST_OPEN_CAP) return res.status(429).json({ error: 'Waitlist is full', code: 'waitlist_full' });
+    const r = await db.collection('waitlist').insertOne(doc);
+    res.status(201).json({ success: true, id: String(r.insertedId) });
+  } catch (err) { console.error('Join waitlist error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Owner: open entries from a date (default today), soonest first.
+app.get('/api/businesses/:slug/waitlist', requireOwner, async (req, res) => {
+  try {
+    const today = T.todayInTz(T.businessTz(req.business));
+    const from = T.isValidYMD(req.query.from) ? req.query.from : today;
+    const q = { businessId: req.business._id.toString(), status: 'open', date: T.isValidYMD(req.query.date) ? req.query.date : { $gte: from } };
+    const list = await db.collection('waitlist').find(q).limit(500).toArray();
+    list.sort((a, b) => String(a.date).localeCompare(String(b.date)) || new Date(a.createdAt) - new Date(b.createdAt));
+    res.json(list.map(waitlistOut));
+  } catch (err) { console.error('List waitlist error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Owner: mark an entry booked / removed (it leaves the open list).
+app.put('/api/businesses/:slug/waitlist/:id', requireOwner, async (req, res) => {
+  try {
+    const status = req.body && req.body.status;
+    if (!['booked', 'removed', 'open'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+    const oid = toObjectId(req.params.id);
+    if (!oid) return res.status(404).json({ error: 'Not found' });
+    const r = await db.collection('waitlist').findOneAndUpdate({ _id: oid, businessId: req.business._id.toString() },
+      { $set: { status, updatedAt: new Date() } }, { returnDocument: 'after' });
+    if (!r) return res.status(404).json({ error: 'Not found' });
+    res.json(waitlistOut(r));
+  } catch (err) { console.error('Update waitlist error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
 // ============ TASKS (ALL PROTECTED) ============
 
 app.get('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
@@ -2911,6 +2990,7 @@ app.delete('/api/admin/businesses/:id', adminAuth, async (req, res) => {
       db.collection('push_tokens').deleteMany({ business_id: bid }),
       db.collection('customer_imports').deleteMany({ businessId: bid }),
       db.collection('calendar_feeds').deleteMany({ businessId: bid }),
+      db.collection('waitlist').deleteMany({ businessId: bid }),
     ]);
     res.json({ success: true, deleted: business.slug });
   } catch (err) {
