@@ -1350,7 +1350,7 @@ class BookingError extends Error {
  * Public bookings: must be in the future, on an open day, inside business (and staff) hours.
  * Owner bookings: may be outside hours (walk-ins, overtime) but not on a past date.
  */
-async function createAppointment(business, input, { isOwner }) {
+async function createAppointment(business, input, { isOwner, extra } = {}) {
   const { serviceId, customerName, customerPhone, customerEmail, date, startTime, notes } = input;
 
   if (!isNonEmptyStr(customerName) || !isNonEmptyStr(customerPhone) || !isNonEmptyStr(date) || !isNonEmptyStr(startTime) || !isNonEmptyStr(serviceId)) {
@@ -1377,7 +1377,8 @@ async function createAppointment(business, input, { isOwner }) {
     notes: isStr(notes) ? notes : '',
     source: isOwner ? 'owner' : 'online',
     manageNonce: manageLink.newNonce(),
-    createdAt: new Date()
+    createdAt: new Date(),
+    ...(extra || {}),
   };
   return insertAppointment(business, appointment, service);
 }
@@ -1591,13 +1592,54 @@ app.post('/api/businesses/:slug/appointments', bookingLimiter, async (req, res) 
       return res.status(403).json({ error: 'Invalid or expired booking token', code: 'booking_token' });
     }
 
-    const appointment = await createAppointment(business, body, { isOwner });
-    res.status(201).json({ ...apptOut(appointment), manageToken: manageTokenFor(appointment), manageUrl: manageUrlFor(business, appointment) });
+    // Sprint 2: recurring bookings (owner only): repeat every 1-4 weeks, 2-26 times in total.
+    const rep = isOwner ? cleanRepeat(body.repeat) : null;
+    const seriesId = rep ? crypto.randomBytes(8).toString('hex') : null;
+    const appointment = await createAppointment(business, body, { isOwner, extra: rep ? { seriesId, seriesIndex: 0, repeat: rep } : undefined });
+    let series;
+    if (rep) {
+      series = { id: seriesId, everyWeeks: rep.everyWeeks, created: [{ id: String(appointment._id), date: appointment.date }], skipped: [] };
+      for (let i = 1; i < rep.count; i++) {
+        const date = T.addDays(body.date, 7 * rep.everyWeeks * i);
+        try {
+          const a = await createAppointment(business, { ...body, date, staffId: appointment.staffId || body.staffId }, { isOwner, extra: { seriesId, seriesIndex: i, repeat: rep } });
+          series.created.push({ id: String(a._id), date });
+        } catch (e) {
+          if (!(e instanceof BookingError)) throw e;
+          series.skipped.push({ date, code: e.code || 'conflict' });
+        }
+      }
+    }
+    res.status(201).json({ ...apptOut(appointment), manageToken: manageTokenFor(appointment), manageUrl: manageUrlFor(business, appointment), ...(series ? { series } : {}) });
   } catch (err) {
     if (err instanceof BookingError) return res.status(err.status).json({ error: err.message, code: err.code });
     console.error('Book appointment error:', err.message);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+function cleanRepeat(r) {
+  if (!r || typeof r !== 'object') return null;
+  const everyWeeks = Number(r.everyWeeks), count = Number(r.count);
+  if (![1, 2, 3, 4].includes(everyWeeks) || !Number.isInteger(count) || count < 2 || count > 26) return null;
+  return { everyWeeks, count };
+}
+
+// Sprint 2: cancel this and every later booking in the same series.
+app.post('/api/businesses/:slug/appointments/:id/cancel-series', requireOwner, async (req, res) => {
+  try {
+    const business = req.business;
+    const appt = await db.collection('appointments').findOne(ownedFilter(business, req.params.id));
+    if (!appt) return res.status(404).json({ error: 'Appointment not found' });
+    if (!appt.seriesId) return res.status(400).json({ error: 'Not a recurring booking', code: 'not_series' });
+    const q = { businessId: appt.businessId, seriesId: appt.seriesId, date: { $gte: appt.date }, status: { $nin: ['cancelled', 'declined', 'completed', 'no_show'] } };
+    const list = await db.collection('appointments').find(q).toArray();
+    const ids = list.map(a => a._id);
+    const reason = isStr(req.body && req.body.cancellationReason) ? req.body.cancellationReason.slice(0, 300) : '';
+    if (ids.length) await db.collection('appointments').updateMany({ _id: { $in: ids } }, { $set: { status: 'cancelled', cancelledBy: 'owner', cancelledAt: new Date(), ...(reason ? { cancellationReason: reason } : {}) } });
+    for (const a of list) void notifyWaitlist(business, a);
+    res.json({ success: true, cancelled: ids.length, dates: list.map(a => a.date).sort() });
+  } catch (err) { console.error('Cancel series error:', err); res.status(500).json({ error: 'Internal server error' }); }
 });
 
 // Update appointment — PROTECTED
