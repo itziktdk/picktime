@@ -71,6 +71,8 @@ const slugRoutes = () => [
   ['post', `/api/businesses/${A.slug}/customers/import`, { rows: [{ name: 'pwned', phone: '0500000000' }] }],
   ['post', `/api/businesses/${A.slug}/customers/import/000000000000000000000000/undo`, {}],
   ['get', `/api/businesses/${A.slug}/calendar-feeds`, null],
+  ['get', `/api/businesses/${A.slug}/waitlist`, null],
+  ['put', `/api/businesses/${A.slug}/waitlist/000000000000000000000000`, { status: 'removed' }],
   ['post', `/api/businesses/${A.slug}/calendar-feeds`, {}],
   ['delete', `/api/businesses/${A.slug}/calendar-feeds/000000000000000000000000`, {}],
   ['get', `/api/businesses/${A.slug}/tasks`, null],
@@ -161,13 +163,14 @@ describe('cross-tenant isolation (C-2)', () => {
   test('route inventory: every /api/businesses/:slug write route is covered by this suite', () => {
     const covered = new Set([...objectRoutes(), ...slugRoutes()].map(([m, url]) => `${m} ${url
       .replace(`/api/businesses/${A.slug}`, '/api/businesses/:slug').replace(`/api/businesses/${B.slug}`, '/api/businesses/:slug')
-      .replace(ids.appt, ':id').replace(ids.rr, ':requestId').replace(ids.cust, ':id').replace(ids.task, ':id').replace(ids.ann, ':id').replace(ids.svc, ':id').replace('/import/000000000000000000000000/', '/import/:batchId/').replace('/calendar-feeds/000000000000000000000000', '/calendar-feeds/:id')}`));
+      .replace(ids.appt, ':id').replace(ids.rr, ':requestId').replace(ids.cust, ':id').replace(ids.task, ':id').replace(ids.ann, ':id').replace(ids.svc, ':id').replace('/import/000000000000000000000000/', '/import/:batchId/').replace('/calendar-feeds/000000000000000000000000', '/calendar-feeds/:id').replace('/waitlist/000000000000000000000000', '/waitlist/:id')}`));
     // Intentionally public (no auth by design): business profile, services, staff, availability, announcements list,
     // booking token, public booking.
     const publicRoutes = new Set([
       'get /api/businesses/:slug', 'get /api/businesses/:slug/services', 'get /api/businesses/:slug/staff',
       'get /api/businesses/:slug/availability', 'get /api/businesses/:slug/announcements',
       'get /api/businesses/:slug/booking-token', 'post /api/businesses/:slug/appointments',
+      'post /api/businesses/:slug/waitlist', // public join (opt-in, rate limited)
     ]);
     const missing = [];
     for (const layer of ctx.srv.app._router.stack) {
