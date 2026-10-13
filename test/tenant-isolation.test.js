@@ -74,6 +74,9 @@ const slugRoutes = () => [
   ['post', `/api/businesses/${A.slug}/customers/import/000000000000000000000000/undo`, {}],
   ['get', `/api/businesses/${A.slug}/calendar-feeds`, null],
   ['get', `/api/businesses/${A.slug}/waitlist`, null],
+  ['get', `/api/businesses/${A.slug}/calendar-sync`, null],
+  ['post', `/api/businesses/${A.slug}/calendar-sync/google/connect`, {}],
+  ['delete', `/api/businesses/${A.slug}/calendar-sync/google`, {}],
   ['put', `/api/businesses/${A.slug}/waitlist/000000000000000000000000`, { status: 'removed' }],
   ['post', `/api/businesses/${A.slug}/calendar-feeds`, {}],
   ['delete', `/api/businesses/${A.slug}/calendar-feeds/000000000000000000000000`, {}],
@@ -165,7 +168,7 @@ describe('cross-tenant isolation (C-2)', () => {
   test('route inventory: every /api/businesses/:slug write route is covered by this suite', () => {
     const covered = new Set([...objectRoutes(), ...slugRoutes()].map(([m, url]) => `${m} ${url
       .replace(`/api/businesses/${A.slug}`, '/api/businesses/:slug').replace(`/api/businesses/${B.slug}`, '/api/businesses/:slug')
-      .replace(ids.appt, ':id').replace(ids.rr, ':requestId').replace(ids.cust, ':id').replace(ids.task, ':id').replace(ids.ann, ':id').replace(ids.svc, ':id').replace('/import/000000000000000000000000/', '/import/:batchId/').replace('/calendar-feeds/000000000000000000000000', '/calendar-feeds/:id').replace('/waitlist/000000000000000000000000', '/waitlist/:id')}`));
+      .replace(ids.appt, ':id').replace(ids.rr, ':requestId').replace(ids.cust, ':id').replace(ids.task, ':id').replace(ids.ann, ':id').replace(ids.svc, ':id').replace('/import/000000000000000000000000/', '/import/:batchId/').replace('/calendar-feeds/000000000000000000000000', '/calendar-feeds/:id').replace('/waitlist/000000000000000000000000', '/waitlist/:id').replace('/calendar-sync/google', '/calendar-sync/:provider')}`));
     // Intentionally public (no auth by design): business profile, services, staff, availability, announcements list,
     // booking token, public booking.
     const publicRoutes = new Set([
