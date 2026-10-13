@@ -70,6 +70,9 @@ const slugRoutes = () => [
   ['put', `/api/businesses/${A.slug}/customers/${ids.cust}`, { name: 'pwned' }],
   ['post', `/api/businesses/${A.slug}/customers/import`, { rows: [{ name: 'pwned', phone: '0500000000' }] }],
   ['post', `/api/businesses/${A.slug}/customers/import/000000000000000000000000/undo`, {}],
+  ['get', `/api/businesses/${A.slug}/calendar-feeds`, null],
+  ['post', `/api/businesses/${A.slug}/calendar-feeds`, {}],
+  ['delete', `/api/businesses/${A.slug}/calendar-feeds/000000000000000000000000`, {}],
   ['get', `/api/businesses/${A.slug}/tasks`, null],
   ['post', `/api/businesses/${A.slug}/tasks`, { text: 'pwned' }],
   ['put', `/api/businesses/${A.slug}/tasks/${ids.task}`, { text: 'pwned' }],
@@ -158,7 +161,7 @@ describe('cross-tenant isolation (C-2)', () => {
   test('route inventory: every /api/businesses/:slug write route is covered by this suite', () => {
     const covered = new Set([...objectRoutes(), ...slugRoutes()].map(([m, url]) => `${m} ${url
       .replace(`/api/businesses/${A.slug}`, '/api/businesses/:slug').replace(`/api/businesses/${B.slug}`, '/api/businesses/:slug')
-      .replace(ids.appt, ':id').replace(ids.rr, ':requestId').replace(ids.cust, ':id').replace(ids.task, ':id').replace(ids.ann, ':id').replace(ids.svc, ':id').replace('/import/000000000000000000000000/', '/import/:batchId/')}`));
+      .replace(ids.appt, ':id').replace(ids.rr, ':requestId').replace(ids.cust, ':id').replace(ids.task, ':id').replace(ids.ann, ':id').replace(ids.svc, ':id').replace('/import/000000000000000000000000/', '/import/:batchId/').replace('/calendar-feeds/000000000000000000000000', '/calendar-feeds/:id')}`));
     // Intentionally public (no auth by design): business profile, services, staff, availability, announcements list,
     // booking token, public booking.
     const publicRoutes = new Set([
