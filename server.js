@@ -361,6 +361,8 @@ app.post('/api/csp-report', express.json({ type: ['application/csp-report', 'app
   } catch { /* never fail a report */ }
   res.status(204).end();
 });
+// S1-F4: contact import sends up to 3000 rows in one request.
+app.use('/api/businesses/:slug/customers/import', express.json({ limit: '1mb' }));
 app.use(express.json({ limit: '200kb' }));
 app.use(sanitizeBody);
 // M-2: legacy records were entity-encoded on write; decode them in every API response.
@@ -740,6 +742,7 @@ app.delete('/api/account', authMiddleware, async (req, res) => {
       db.collection('tasks').deleteMany({ businessId: { $in: [bid, bidStr] } }),
       db.collection('announcements').deleteMany({ businessId: { $in: [bid, bidStr] } }),
       db.collection('push_tokens').deleteMany({ business_id: bidStr }),
+      db.collection('customer_imports').deleteMany({ businessId: bidStr }),
       db.collection('businesses').deleteOne({ _id: bid }),
     ]);
     logAuth('account.deleted', req, { slug: business.slug });
@@ -2195,6 +2198,121 @@ function cleanCustomerProfile(body, out) {
   return null;
 }
 
+// ============ Sprint 1 F4: CONTACT IMPORT (Excel/CSV/phone contacts) ============
+// The client parses the file and maps columns; the server validates, dedupes by normalized phone
+// (inside the file and against existing customers), merges into existing customers without
+// overwriting what the owner typed, and records a batch so the import can be undone.
+const IMPORT_MAX_ROWS = 3000;
+const IMPORT_UNDO_DAYS = 7;
+function importRow(r) {
+  if (!r || typeof r !== 'object') return { error: 'invalid_row' };
+  const name = isStr(r.name) ? r.name.trim().slice(0, 80) : '';
+  const phone = phoneKey(isStr(r.phone) || typeof r.phone === 'number' ? String(r.phone) : '');
+  if (!/^0\d{8,9}$/.test(phone) && !/^\+\d{8,15}$/.test(phone)) return { error: 'invalid_phone' };
+  const out = { name: name || phone, phone };
+  if (isStr(r.email) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(r.email.trim())) out.email = r.email.trim().slice(0, 120);
+  if (isStr(r.notes) && r.notes.trim()) out.notes = r.notes.trim().slice(0, 500);
+  if (isStr(r.birthday) && /^(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(r.birthday)) out.birthday = r.birthday;
+  if (Array.isArray(r.tags)) out.tags = r.tags.filter(isStr).map(t => t.trim().slice(0, 30)).filter(Boolean).slice(0, 10);
+  return { row: out };
+}
+
+app.post('/api/businesses/:slug/customers/import', requireOwner, async (req, res) => {
+  try {
+    const { rows, dryRun, source } = req.body || {};
+    if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'rows must be a non-empty array' });
+    if (rows.length > IMPORT_MAX_ROWS) return res.status(400).json({ error: `Up to ${IMPORT_MAX_ROWS} rows per import`, code: 'too_many_rows' });
+    const business = req.business;
+    const bidStr = business._id.toString();
+    const skipped = [];
+    const byPhone = new Map(); // in-file dedupe: later rows fill gaps of earlier ones
+    rows.forEach((r, i) => {
+      const { row, error } = importRow(r);
+      if (error) { skipped.push({ index: i, reason: error }); return; }
+      const prev = byPhone.get(row.phone);
+      if (prev) {
+        for (const k of ['email', 'notes', 'birthday']) if (!prev[k] && row[k]) prev[k] = row[k];
+        if (prev.name === prev.phone && row.name !== row.phone) prev.name = row.name;
+        if (row.tags) prev.tags = [...new Set([...(prev.tags || []), ...row.tags])];
+        skipped.push({ index: i, reason: 'duplicate_in_file' });
+      } else byPhone.set(row.phone, row);
+    });
+    const phones = [...byPhone.keys()];
+    const variants = [...new Set(phones.flatMap(p => phoneVariants(p)))];
+    const existing = variants.length
+      ? await db.collection('customers').find({ businessId: bizIdFilter(business), phone: { $in: variants } }).toArray()
+      : [];
+    const existingByKey = new Map(existing.map(c => [phoneKey(c.phone), c]));
+    const toCreate = [], toMerge = [];
+    for (const row of byPhone.values()) {
+      const ex = existingByKey.get(row.phone);
+      if (!ex) { toCreate.push(row); continue; }
+      const set = {};
+      if ((!ex.name || ex.name === ex.phone) && row.name !== row.phone) set.name = row.name;
+      for (const k of ['email', 'notes', 'birthday']) if (!ex[k] && row[k]) set[k] = row[k];
+      const tags = row.tags ? [...new Set([...(ex.tags || []), ...row.tags])] : null;
+      if (tags && tags.length !== (ex.tags || []).length) set.tags = tags;
+      if (Object.keys(set).length) toMerge.push({ ex, set });
+    }
+    const summary = { total: rows.length, created: toCreate.length, merged: toMerge.length, unchanged: byPhone.size - toCreate.length - toMerge.length, skipped };
+    if (dryRun) return res.json({ dryRun: true, ...summary });
+
+    const batchId = crypto.randomBytes(12).toString('hex');
+    const now = new Date();
+    const src = ['excel', 'csv', 'contacts'].includes(source) ? source : 'file';
+    const docs = toCreate.map(r => ({
+      businessId: bidStr, name: r.name, phone: r.phone, email: r.email || '', notes: r.notes || '',
+      isVip: false, tags: r.tags || [], totalVisits: 0, totalSpent: 0, lastVisit: null, birthday: r.birthday || '',
+      source: 'import', importBatchId: batchId, createdAt: now,
+    }));
+    let createdIds = [];
+    for (let i = 0; i < docs.length; i += 500) {
+      const chunk = docs.slice(i, i + 500);
+      const r = await db.collection('customers').insertMany(chunk, { ordered: false });
+      createdIds = createdIds.concat(Object.values(r.insertedIds).map(String));
+    }
+    const merged = [];
+    for (const { ex, set } of toMerge) {
+      const before = {}; for (const k of Object.keys(set)) before[k] = ex[k] === undefined ? null : ex[k];
+      await db.collection('customers').updateOne({ _id: ex._id }, { $set: set });
+      merged.push({ id: String(ex._id), before, fields: Object.keys(set) });
+    }
+    await db.collection('customer_imports').insertOne({ batchId, businessId: bidStr, source: src, createdIds, merged, createdAt: now, undone: false });
+    res.status(201).json({ batchId, ...summary, undoUntil: new Date(now.getTime() + IMPORT_UNDO_DAYS * 864e5) });
+  } catch (err) {
+    console.error('Import customers error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/businesses/:slug/customers/import/:batchId/undo', requireOwner, async (req, res) => {
+  try {
+    const bidStr = req.business._id.toString();
+    const batch = await db.collection('customer_imports').findOne({ batchId: sanitizeQuery(req.params.batchId), businessId: bidStr });
+    if (!batch) return res.status(404).json({ error: 'Import not found' });
+    if (batch.undone) return res.status(409).json({ error: 'Import already undone', code: 'already_undone' });
+    if (Date.now() - new Date(batch.createdAt).getTime() > IMPORT_UNDO_DAYS * 864e5) return res.status(409).json({ error: 'Too late to undo', code: 'expired' });
+    // Created customers are removed only if they still belong to this batch and have no visits yet.
+    const ids = (batch.createdIds || []).map(id => toObjectId(id)).filter(Boolean);
+    const del = ids.length
+      ? await db.collection('customers').deleteMany({ _id: { $in: ids }, businessId: bidStr, importBatchId: batch.batchId, totalVisits: 0 })
+      : { deletedCount: 0 };
+    let restored = 0;
+    for (const m of batch.merged || []) {
+      const oid = toObjectId(m.id); if (!oid) continue;
+      const set = {}, unset = {};
+      for (const [k, v] of Object.entries(m.before || {})) { if (v === null) unset[k] = ''; else set[k] = v; }
+      const upd = {}; if (Object.keys(set).length) upd.$set = set; if (Object.keys(unset).length) upd.$unset = unset;
+      if (Object.keys(upd).length) { await db.collection('customers').updateOne({ _id: oid, businessId: bizIdFilter(req.business) }, upd); restored++; }
+    }
+    await db.collection('customer_imports').updateOne({ _id: batch._id }, { $set: { undone: true, undoneAt: new Date() } });
+    res.json({ success: true, removed: del.deletedCount, kept: ids.length - del.deletedCount, restored });
+  } catch (err) {
+    console.error('Undo import error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.post('/api/businesses/:slug/customers', requireOwner, async (req, res) => {
   try {
     const { name, phone, email, notes, birthday } = req.body || {};
@@ -2712,6 +2830,7 @@ app.delete('/api/admin/businesses/:id', adminAuth, async (req, res) => {
       db.collection('tasks').deleteMany({ businessId: { $in: [bidObj, bid] } }),
       db.collection('announcements').deleteMany({ businessId: { $in: [bidObj, bid] } }),
       db.collection('push_tokens').deleteMany({ business_id: bid }),
+      db.collection('customer_imports').deleteMany({ businessId: bid }),
     ]);
     res.json({ success: true, deleted: business.slug });
   } catch (err) {
