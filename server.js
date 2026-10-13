@@ -743,6 +743,7 @@ app.delete('/api/account', authMiddleware, async (req, res) => {
       db.collection('announcements').deleteMany({ businessId: { $in: [bid, bidStr] } }),
       db.collection('push_tokens').deleteMany({ business_id: bidStr }),
       db.collection('customer_imports').deleteMany({ businessId: bidStr }),
+      db.collection('calendar_feeds').deleteMany({ businessId: bidStr }),
       db.collection('businesses').deleteOne({ _id: bid }),
     ]);
     logAuth('account.deleted', req, { slug: business.slug });
@@ -809,7 +810,7 @@ function cleanServiceInput(s) {
 
 // ---- Slugs (M-4): format + reserved words (app routes, static files, brand names)
 const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{1,48})[a-z0-9]$/;
-const RESERVED_SLUGS = new Set([
+const RESERVED_SLUGS = new Set(['cal', 
   'admin', 'api', 'app', 'login', 'logout', 'register', 'signup', 'signin', 'auth', 'account',
   'settings', 'dashboard', 'privacy', 'support', 'terms', 'help', 'about', 'contact', 'pricing',
   'book', 'booking', 'manage', 'staff', 'services', 'customers', 'customer-detail', 'appointments',
@@ -2382,6 +2383,84 @@ app.put('/api/businesses/:slug/customers/:id', requireOwner, async (req, res) =>
   }
 });
 
+// ============ Sprint 1 F5: ICS CALENDAR FEED (owner / per staff, secret revocable link) ============
+const FEED_STATUSES = ['confirmed', 'pending', 'reschedule_requested', 'completed'];
+const feedUrl = (token) => `${PUBLIC_BASE_URL}/cal/${token}.ics`;
+const feedOut = (f, business) => ({
+  id: String(f._id), staffId: f.staffId || null,
+  staffName: f.staffId ? ((business.staff || []).find(s => String(s.id || s._id) === f.staffId) || {}).name || '' : '',
+  showNames: !!f.showNames, url: feedUrl(f.token), createdAt: f.createdAt,
+});
+
+app.get('/api/businesses/:slug/calendar-feeds', requireOwner, async (req, res) => {
+  try {
+    const feeds = await db.collection('calendar_feeds').find({ businessId: req.business._id.toString(), revokedAt: null }).toArray();
+    res.json(feeds.map(f => feedOut(f, req.business)));
+  } catch (err) { console.error('List feeds error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+// Create (or replace) the link for the owner (staffId empty) or one staff member. Replacing revokes the old link.
+app.post('/api/businesses/:slug/calendar-feeds', requireOwner, async (req, res) => {
+  try {
+    const b = req.business, bidStr = b._id.toString();
+    const staffId = isStr(req.body?.staffId) && req.body.staffId ? req.body.staffId.slice(0, 40) : null;
+    if (staffId && !(b.staff || []).some(s => String(s.id || s._id) === staffId)) return res.status(400).json({ error: 'Unknown staff member' });
+    const showNames = req.body?.showNames === true;
+    await db.collection('calendar_feeds').updateMany({ businessId: bidStr, staffId, revokedAt: null }, { $set: { revokedAt: new Date() } });
+    const doc = { businessId: bidStr, staffId, showNames, token: crypto.randomBytes(24).toString('hex'), createdAt: new Date(), revokedAt: null };
+    const r = await db.collection('calendar_feeds').insertOne(doc);
+    doc._id = r.insertedId;
+    res.status(201).json(feedOut(doc, b));
+  } catch (err) { console.error('Create feed error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+app.delete('/api/businesses/:slug/calendar-feeds/:id', requireOwner, async (req, res) => {
+  try {
+    const oid = toObjectId(req.params.id);
+    if (!oid) return res.status(404).json({ error: 'Not found' });
+    const r = await db.collection('calendar_feeds').updateOne({ _id: oid, businessId: req.business._id.toString(), revokedAt: null }, { $set: { revokedAt: new Date() } });
+    if (!r.matchedCount) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (err) { console.error('Revoke feed error:', err); res.status(500).json({ error: 'Internal server error' }); }
+});
+
+const feedLimiter = rateLimit({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
+app.get('/cal/:token.ics', feedLimiter, async (req, res) => {
+  try {
+    const token = String(req.params.token || '');
+    if (!/^[a-f0-9]{48}$/.test(token)) return res.status(404).type('text/plain').send('Not found');
+    const feed = await db.collection('calendar_feeds').findOne({ token, revokedAt: null });
+    if (!feed) return res.status(404).type('text/plain').send('Not found');
+    const b = await db.collection('businesses').findOne({ _id: toObjectId(feed.businessId) });
+    if (!b) return res.status(404).type('text/plain').send('Not found');
+    const tz = T.businessTz(b);
+    const today = T.todayInTz(tz);
+    const q = { businessId: bizIdFilter(b), status: { $in: FEED_STATUSES }, date: { $gte: T.addDays(today, -30), $lte: T.addDays(today, 180) } };
+    if (feed.staffId) q.staffId = feed.staffId;
+    const appts = await db.collection('appointments').find(q).limit(3000).toArray();
+    const bname = text.decodeEntities(b.name || 'Snaptor');
+    const events = appts.filter(a => T.isValidYMD(a.date) && T.isValidHM(a.startTime)).map(a => {
+      const startMs = T.zonedTimeToUtcMs(a.date, a.startTime, tz);
+      let endMs = T.isValidHM(a.endTime) ? T.zonedTimeToUtcMs(a.date, a.endTime, tz) : startMs + (Number(a.duration) || 30) * 60000;
+      if (endMs <= startMs) endMs = startMs + 30 * 60000;
+      const service = text.decodeEntities(a.serviceName || '');
+      const who = feed.showNames ? text.decodeEntities(a.customerName || '') : '';
+      const staff = !feed.staffId && a.staffName ? text.decodeEntities(a.staffName) : '';
+      return {
+        uid: `${a._id}@snaptor.app`, startMs, endMs, tentative: a.status === 'pending',
+        updatedMs: a.updatedAt ? new Date(a.updatedAt).getTime() : undefined,
+        summary: [who, service || 'Snaptor'].filter(Boolean).join(' · ') + (staff ? ` (${staff})` : ''),
+        description: [feed.showNames && a.customerPhone ? a.customerPhone : '', a.status === 'pending' ? 'Pending / ממתין לאישור' : ''].filter(Boolean).join('\n'),
+      };
+    });
+    const staffName = feed.staffId ? ((b.staff || []).find(s => String(s.id || s._id) === feed.staffId) || {}).name : '';
+    res.set('Content-Type', 'text/calendar; charset=utf-8');
+    res.set('Cache-Control', 'private, max-age=300');
+    res.set('X-Robots-Tag', 'noindex');
+    res.send(ics.buildFeed({ name: staffName ? `${bname} – ${text.decodeEntities(staffName)}` : bname, events }));
+  } catch (err) { console.error('Feed error:', err); res.status(500).type('text/plain').send('Error'); }
+});
+
 // ============ TASKS (ALL PROTECTED) ============
 
 app.get('/api/businesses/:slug/tasks', requireOwner, async (req, res) => {
@@ -2831,6 +2910,7 @@ app.delete('/api/admin/businesses/:id', adminAuth, async (req, res) => {
       db.collection('announcements').deleteMany({ businessId: { $in: [bidObj, bid] } }),
       db.collection('push_tokens').deleteMany({ business_id: bid }),
       db.collection('customer_imports').deleteMany({ businessId: bid }),
+      db.collection('calendar_feeds').deleteMany({ businessId: bid }),
     ]);
     res.json({ success: true, deleted: business.slug });
   } catch (err) {
